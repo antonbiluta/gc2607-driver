@@ -334,10 +334,23 @@ EOF
 }
 
 install_ipu_bridge_to_kernel() {
-    local built="/var/lib/dkms/${DKMS_IPU_NAME}/${DKMS_IPU_VER}/build/ipu_bridge.ko"
     local dst="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
 
-    [ -f "$built" ] || die "DKMS build output not found: $built"
+    # DKMS stores built modules in one of these locations depending on version
+    local built
+    built=$(find "/var/lib/dkms/${DKMS_IPU_NAME}/${DKMS_IPU_VER}" \
+        \( -name "ipu_bridge.ko" -o -name "ipu_bridge.ko.xz" \) \
+        2>/dev/null | head -1)
+
+    if [ -z "$built" ]; then
+        # Also check build/ directory (some DKMS versions keep it there)
+        built=$(find "/var/lib/dkms/${DKMS_IPU_NAME}" \
+            \( -name "ipu_bridge.ko" -o -name "ipu_bridge.ko.xz" \) \
+            2>/dev/null | head -1)
+    fi
+
+    [ -n "$built" ] || die "DKMS build output not found. Searched: /var/lib/dkms/${DKMS_IPU_NAME}/. Try: find /var/lib/dkms/${DKMS_IPU_NAME} -name '*.ko*'"
+    log "Using built module: $built"
 
     # Backup original (only once)
     if [ -f "$dst" ] && [ ! -f "${BACKUP_DIR}/ipu_bridge.ko.xz.orig" ]; then
@@ -349,7 +362,15 @@ install_ipu_bridge_to_kernel() {
     # Compress with CRC32 (required by Fedora kernel loader)
     local tmp
     tmp=$(mktemp -d)
-    cp "$built" "$tmp/ipu_bridge.ko"
+
+    if [[ "$built" == *.xz ]]; then
+        # Already compressed — decompress first, then recompress with CRC32
+        xz -dc "$built" > "$tmp/ipu_bridge.ko" || \
+            { rm -rf "$tmp"; die "Failed to decompress $built"; }
+    else
+        cp "$built" "$tmp/ipu_bridge.ko"
+    fi
+
     xz -9 --check=crc32 "$tmp/ipu_bridge.ko" || \
         { rm -rf "$tmp"; die "xz compression failed"; }
 
