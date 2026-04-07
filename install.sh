@@ -555,34 +555,52 @@ sign_modules() {
 start_camera() {
     log "=== Phase 10: Starting camera ==="
 
-    # Unload stale modules
     systemctl stop gc2607-camera.service 2>/dev/null || true
-    for mod in gc2607 ipu_bridge intel-ipu6-isys intel-ipu6; do
-        modprobe -r "$mod" 2>/dev/null || true
+
+    # Try to unload modules for hot-reload.
+    # If busy (e.g. IPU6 already in use) — skip and recommend reboot.
+    local need_reboot=0
+    for mod in gc2607 intel-ipu6-isys intel-ipu6 ipu_bridge; do
+        if ! modprobe -r "$mod" 2>/dev/null; then
+            warn "Cannot unload $mod (device busy) — reboot required"
+            need_reboot=1
+        fi
     done
-    sleep 1
 
-    # Load stack
-    modprobe intel-ipu6    || warn "intel-ipu6 load failed (may already be built-in)"
-    modprobe ipu_bridge    || die "ipu_bridge load failed. Check: dmesg | tail -20"
-
-    # Verify GCTI2607 is recognized
-    if ! dmesg | tail -30 | grep -qi "GCTI2607\|gc2607"; then
-        warn "GC2607 not visible in dmesg yet (may appear after gc2607.ko loads)"
+    if [ "$need_reboot" -eq 1 ]; then
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo -e "${YELLOW}⚠  Installation complete. Reboot required.${NC}"
+        echo ""
+        echo "  Some modules are in use and cannot be reloaded live."
+        echo "  After reboot the camera service will start automatically."
+        echo ""
+        echo "  sudo reboot"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        save_state
+        exit 0
     fi
 
-    modprobe gc2607 2>/dev/null || insmod "$(find /lib/modules/$KERN -name 'gc2607.ko*' | head -1)" || \
-        die "gc2607 module load failed"
+    sleep 1
 
+    # Load fresh module stack
+    modprobe intel-ipu6 2>/dev/null || warn "intel-ipu6 load failed (may be built-in)"
+    modprobe ipu_bridge || die "ipu_bridge load failed. Check: dmesg | tail -20"
+    sleep 1
+
+    modprobe gc2607 2>/dev/null || \
+        insmod "$(find /lib/modules/$KERN -name 'gc2607.ko*' | head -1)" || \
+        die "gc2607 load failed. Check: dmesg | tail -20"
     sleep 2
-    systemctl start gc2607-camera.service
 
+    systemctl start gc2607-camera.service
     log "Waiting for service (10s)..."
     sleep 10
 
     # Restart wireplumber for current user
-    local user; user=$(real_user)
-    local uid; uid=$(real_uid)
+    local user uid
+    user=$(real_user)
+    uid=$(real_uid)
     if [ -n "$user" ] && [ "$uid" -ne 0 ]; then
         su - "$user" -c \
             "XDG_RUNTIME_DIR=/run/user/${uid} systemctl --user restart wireplumber" \
