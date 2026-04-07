@@ -15,21 +15,51 @@ die() { echo "[gc2607] ERROR: $*" >&2; exit 1; }
 
 # ── Load Modules ────────────────────────────────────────────────────
 
+# Check if the currently loaded ipu_bridge has GC2607 (GCTI2607) support.
+ipu_bridge_has_gc2607() {
+    local f
+    f=$(modinfo -F filename ipu_bridge 2>/dev/null) || return 1
+    if [[ "$f" == *.xz ]]; then
+        xz -dc "$f" 2>/dev/null | strings | grep -q "GCTI2607"
+    else
+        strings "$f" 2>/dev/null | grep -q "GCTI2607"
+    fi
+}
+
 log "Loading kernel modules..."
-for mod in videodev v4l2-async ipu_bridge intel-ipu6 intel-ipu6-isys; do
-    modprobe "$mod" 2>/dev/null || true
-done
-sleep 1
+modprobe videodev   2>/dev/null || true
+modprobe v4l2-async 2>/dev/null || true
+
+# If ipu_bridge is loaded but missing GC2607 support — reload the full stack.
+if grep -q "^ipu_bridge " /proc/modules && ! ipu_bridge_has_gc2607; then
+    log "ipu_bridge loaded without GC2607 support — reloading stack..."
+    for mod in gc2607 intel-ipu6-isys intel-ipu6 ipu_bridge; do
+        modprobe -r "$mod" 2>/dev/null || true
+        sleep 0.3
+    done
+    sleep 1
+fi
+
+# Load ipu_bridge (patched version from DKMS must take priority)
+if ! grep -q "^ipu_bridge " /proc/modules; then
+    modprobe ipu_bridge || die "ipu_bridge load failed. Check: dmesg | tail -20"
+fi
+
+# Verify the loaded version actually has GC2607 support
+if ! ipu_bridge_has_gc2607; then
+    die "ipu_bridge loaded but missing GC2607 support. Patched module not installed correctly. Re-run: sudo ./install.sh"
+fi
+log "ipu_bridge OK (GC2607 support confirmed)"
+
+modprobe intel-ipu6      2>/dev/null || true
+modprobe intel-ipu6-isys 2>/dev/null || true
+sleep 2
 
 # Load gc2607
 if ! grep -q "^gc2607 " /proc/modules; then
-    if [ -f "/lib/modules/${KVER}/extra/gc2607.ko" ]; then
-        modprobe gc2607
-    elif [ -f "${SCRIPT_DIR}/gc2607.ko" ]; then
-        insmod "${SCRIPT_DIR}/gc2607.ko"
-    else
-        die "gc2607.ko not found"
-    fi
+    modprobe gc2607 2>/dev/null || \
+        insmod "$(find /lib/modules/${KVER} -name 'gc2607.ko*' | head -1)" || \
+        die "gc2607.ko not found or failed to load"
 fi
 sleep 2
 
