@@ -163,11 +163,19 @@ CLEAN="make clean"
 AUTOINSTALL="yes"
 EOF
 
-    dkms add     "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}"
-    dkms build   "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}" -k "$KERN"
-    dkms install "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}" -k "$KERN" --force
+    dkms add "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}"
 
-    log "gc2607.ko installed via DKMS"
+    dkms build "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}" -k "$KERN" || \
+        die "DKMS build of gc2607 failed. Check: dkms status && cat /var/lib/dkms/gc2607/1.0/build/make.log"
+
+    dkms install "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}" -k "$KERN" --force || \
+        die "DKMS install of gc2607 failed"
+
+    # Verify module is actually in place
+    local gc2607_ko
+    gc2607_ko=$(find "/lib/modules/${KERN}" -name "gc2607.ko*" | head -1)
+    [ -n "$gc2607_ko" ] || die "gc2607.ko not found after DKMS install"
+    log "gc2607.ko installed: $gc2607_ko"
 }
 
 # ── Phase 3: ipu_bridge patch via DKMS ────────────────────────────────
@@ -312,77 +320,50 @@ CLEAN="make clean"
 AUTOINSTALL="yes"
 EOF
 
-    dkms add     "${DKMS_IPU_NAME}/${DKMS_IPU_VER}"
-    dkms build   "${DKMS_IPU_NAME}/${DKMS_IPU_VER}" -k "$KERN" || \
-        die "DKMS build of ipu_bridge failed. Check: dkms status"
-    dkms install "${DKMS_IPU_NAME}/${DKMS_IPU_VER}" -k "$KERN" --force
+    dkms add "${DKMS_IPU_NAME}/${DKMS_IPU_VER}"
+    dkms build "${DKMS_IPU_NAME}/${DKMS_IPU_VER}" -k "$KERN" || \
+        die "DKMS build of ipu_bridge failed. Check: cat /var/lib/dkms/ipu-bridge-gc2607/1.0/build/make.log"
 
-    # Compress installed module with crc32 (required by Fedora kernel loader)
-    compress_ipu_bridge
+    # Use DKMS only for building; install manually to kernel directory
+    # to guarantee priority over the original module (Fedora DKMS 3.x
+    # ignores DEST_MODULE_LOCATION and installs to /extra/ which loses
+    # to /kernel/ in some depmod configurations).
+    install_ipu_bridge_to_kernel
 
-    log "ipu_bridge patched and installed via DKMS"
+    log "ipu_bridge patched and installed"
 }
 
-compress_ipu_bridge() {
-    # Fedora kernel loader requires xz with CRC32 (not CRC64).
-    # DKMS usually gets this right, but verify and fix if needed.
+install_ipu_bridge_to_kernel() {
+    local built="/var/lib/dkms/${DKMS_IPU_NAME}/${DKMS_IPU_VER}/build/ipu_bridge.ko"
+    local dst="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
 
-    # Backup original in-kernel ipu_bridge (only once)
-    local orig="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
-    if [ -f "$orig" ] && [ ! -f "${BACKUP_DIR}/ipu_bridge.ko.xz.orig" ]; then
+    [ -f "$built" ] || die "DKMS build output not found: $built"
+
+    # Backup original (only once)
+    if [ -f "$dst" ] && [ ! -f "${BACKUP_DIR}/ipu_bridge.ko.xz.orig" ]; then
         mkdir -p "$BACKUP_DIR"
-        cp "$orig" "${BACKUP_DIR}/ipu_bridge.ko.xz.orig"
-        log "Backed up original ipu_bridge.ko.xz"
+        cp "$dst" "${BACKUP_DIR}/ipu_bridge.ko.xz.orig"
+        log "Backed up original: $dst"
     fi
 
-    # Find the DKMS-installed module (in extra/ or updates/dkms/)
-    local mod
-    mod=$(find "/lib/modules/${KERN}" \
-        \( -path "*/extra/ipu_bridge.ko.xz" \
-        -o -path "*/updates/dkms/ipu_bridge.ko.xz" \
-        -o -name "ipu_bridge.ko" \) \
-        -not -name "*.bak" 2>/dev/null | head -1)
+    # Compress with CRC32 (required by Fedora kernel loader)
+    local tmp
+    tmp=$(mktemp -d)
+    cp "$built" "$tmp/ipu_bridge.ko"
+    xz -9 --check=crc32 "$tmp/ipu_bridge.ko" || \
+        { rm -rf "$tmp"; die "xz compression failed"; }
 
-    [ -n "$mod" ] || { warn "ipu_bridge module not found after DKMS install"; return; }
-    log "Checking module: $mod"
+    # Verify GCTI2607 is in the built module
+    xz -dc "$tmp/ipu_bridge.ko.xz" | strings | grep -q "GCTI2607" || \
+        { rm -rf "$tmp"; die "GCTI2607 not found in built ipu_bridge.ko — patch may have failed"; }
 
-    # If uncompressed .ko — compress it in place
-    if [[ "$mod" != *.xz ]]; then
-        warn "Module is uncompressed, compressing with CRC32..."
-        xz -9 --check=crc32 -f "$mod"
-        mod="${mod}.xz"
-        depmod -a "$KERN"
-        log "Compressed: $mod"
-        return
-    fi
-
-    # If .xz — check CRC type (CRC32 required, CRC64 is wrong)
-    local crc_type
-    crc_type=$(xz --robot -lv "$mod" 2>/dev/null | awk '/^file/{print $8}')
-    log "Module compression check: $crc_type"
-
-    if [ "$crc_type" = "CRC32" ]; then
-        log "CRC32 confirmed — no recompression needed"
-        return
-    fi
-
-    warn "Module uses $crc_type instead of CRC32 — recompressing..."
-    local tmpdir
-    tmpdir=$(mktemp -d)
-
-    xz -d -c "$mod" > "$tmpdir/ipu_bridge.ko" \
-        || { rm -rf "$tmpdir"; die "Failed to decompress $mod"; }
-
-    xz -9 --check=crc32 "$tmpdir/ipu_bridge.ko" \
-        || { rm -rf "$tmpdir"; die "Failed to recompress with CRC32"; }
-
-    # Overwrite in-place (avoids cp same-file error)
-    cp "$tmpdir/ipu_bridge.ko.xz" "$mod"
-    rm -rf "$tmpdir"
+    cp "$tmp/ipu_bridge.ko.xz" "$dst"
+    rm -rf "$tmp"
 
     depmod -a "$KERN"
-    log "Recompressed with CRC32: $mod"
+    log "Installed patched ipu_bridge.ko.xz → $dst"
 }
+
 
 # ── Phase 4: Build gc2607_isp ──────────────────────────────────────────
 build_isp() {
