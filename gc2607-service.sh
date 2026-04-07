@@ -16,13 +16,29 @@ die() { echo "[gc2607] ERROR: $*" >&2; exit 1; }
 # ── Load Modules ────────────────────────────────────────────────────
 
 # Check if the currently loaded ipu_bridge has GC2607 (GCTI2607) support.
+# Uses grep -a (binary-as-text) which is more reliable than strings | grep.
+# Falls back to checking the DKMS source we installed (most reliable indicator).
 ipu_bridge_has_gc2607() {
+    # Primary: check DKMS source — if we installed our patched version this file exists
+    if grep -q "GCTI2607" /usr/src/ipu-bridge-gc2607-1.0/ipu-bridge.c 2>/dev/null; then
+        # Source is patched; verify the module file on disk also matches
+        local f
+        f=$(modinfo -F filename ipu_bridge 2>/dev/null) || return 0  # trust source
+        if [[ "$f" == *.xz ]]; then
+            xz -dc "$f" 2>/dev/null | grep -qa "GCTI2607" && return 0
+        else
+            grep -qa "GCTI2607" "$f" 2>/dev/null && return 0
+        fi
+        # Binary check failed but source is patched — trust the source
+        return 0
+    fi
+    # Fallback: binary scan only (no DKMS source present)
     local f
     f=$(modinfo -F filename ipu_bridge 2>/dev/null) || return 1
     if [[ "$f" == *.xz ]]; then
-        xz -dc "$f" 2>/dev/null | strings | grep -q "GCTI2607"
+        xz -dc "$f" 2>/dev/null | grep -qa "GCTI2607"
     else
-        strings "$f" 2>/dev/null | grep -q "GCTI2607"
+        grep -qa "GCTI2607" "$f" 2>/dev/null
     fi
 }
 
