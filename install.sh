@@ -1,0 +1,602 @@
+#!/bin/bash
+# =============================================================================
+# GC2607 Camera Driver Installer
+# Huawei MateBook Pro VGHH-XX / Intel IPU6 / Fedora
+#
+# Usage:   sudo ./install.sh
+# Re-run after kernel updates to rebuild modules.
+#
+# What this does:
+#   1. Installs build dependencies (gcc, kernel-devel, dkms, v4l2loopback)
+#   2. Registers gc2607.ko in DKMS (auto-rebuild on kernel updates)
+#   3. Downloads kernel source, patches ipu_bridge with GC2607 support,
+#      registers in DKMS
+#   4. Compiles gc2607_isp (C userspace ISP, ~5% CPU)
+#   5. Installs everything: /opt/gc2607/, systemd service, wireplumber config
+# =============================================================================
+
+set -euo pipefail
+
+# ── Paths ──────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KERN=$(uname -r)
+KERN_BASE=$(echo "$KERN" | grep -oP '^\d+\.\d+\.\d+')
+KERN_MAJOR=$(echo "$KERN" | cut -d. -f1)
+
+INSTALL_DIR="/opt/gc2607"
+STATE_DIR="/var/lib/gc2607-driver"
+STATE_FILE="$STATE_DIR/state"
+BACKUP_DIR="$STATE_DIR/backups"
+CONF_FILE="/etc/gc2607/gc2607.conf"
+
+DKMS_GC2607_NAME="gc2607"
+DKMS_GC2607_VER="1.0"
+DKMS_GC2607_SRC="/usr/src/${DKMS_GC2607_NAME}-${DKMS_GC2607_VER}"
+
+DKMS_IPU_NAME="ipu-bridge-gc2607"
+DKMS_IPU_VER="1.0"
+DKMS_IPU_SRC="/usr/src/${DKMS_IPU_NAME}-${DKMS_IPU_VER}"
+
+WORK_DIR="$STATE_DIR/build"
+TARBALL="$WORK_DIR/linux-${KERN_BASE}.tar.xz"
+
+# ── Helpers ────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[gc2607]${NC} $*"; }
+warn() { echo -e "${YELLOW}[gc2607]${NC} $*"; }
+die()  { echo -e "${RED}[gc2607] ERROR:${NC} $*" >&2; exit 1; }
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "Run with sudo: sudo $0"
+}
+
+real_user() {
+    echo "${SUDO_USER:-$(logname 2>/dev/null || echo "")}"
+}
+
+real_uid() { id -u "$(real_user)"; }
+real_gid() { id -g "$(real_user)"; }
+real_home() { getent passwd "$(real_user)" | cut -d: -f6; }
+
+# ── Phase 1: Dependencies ──────────────────────────────────────────────
+install_deps() {
+    log "=== Phase 1: Installing dependencies ==="
+
+    if command -v dnf &>/dev/null; then
+        log "Detected Fedora/RHEL (dnf)"
+
+        # Basic build tools + kernel-devel for current kernel
+        dnf install -y \
+            gcc make \
+            "kernel-devel-${KERN}" \
+            elfutils-libelf-devel \
+            dkms \
+            wget \
+            v4l-utils \
+            2>/dev/null || true
+
+        # v4l2loopback: try RPM Fusion, fallback to DKMS build
+        if ! modinfo v4l2loopback &>/dev/null; then
+            log "Installing v4l2loopback..."
+            if dnf install -y v4l2loopback 2>/dev/null || \
+               dnf install -y v4l2loopback-dkms 2>/dev/null; then
+                log "v4l2loopback installed from package"
+            else
+                log "Building v4l2loopback via DKMS..."
+                install_v4l2loopback_dkms
+            fi
+        fi
+
+    elif command -v apt-get &>/dev/null; then
+        log "Detected Debian/Ubuntu (apt)"
+        apt-get install -y \
+            gcc make \
+            "linux-headers-${KERN}" \
+            dkms \
+            wget \
+            v4l-utils \
+            v4l2loopback-dkms \
+            2>/dev/null || true
+    else
+        warn "Unknown distro. Install manually: gcc make kernel-devel dkms wget v4l-utils"
+    fi
+
+    # kernel-devel sanity check
+    [ -d "/lib/modules/${KERN}/build" ] || \
+        die "kernel-devel not found for ${KERN}. Install: sudo dnf install kernel-devel-${KERN}"
+
+    log "Dependencies OK"
+}
+
+install_v4l2loopback_dkms() {
+    local tmp; tmp=$(mktemp -d)
+    local ver="0.13.1"
+    local url="https://github.com/umlaeute/v4l2loopback/archive/v${ver}.tar.gz"
+    wget -q -O "$tmp/v4l2loopback.tar.gz" "$url" || \
+        die "Failed to download v4l2loopback source"
+    tar xf "$tmp/v4l2loopback.tar.gz" -C "$tmp"
+    local src_dir="$tmp/v4l2loopback-${ver}"
+    mkdir -p "/usr/src/v4l2loopback-${ver}"
+    cp -r "$src_dir"/* "/usr/src/v4l2loopback-${ver}/"
+    cat > "/usr/src/v4l2loopback-${ver}/dkms.conf" <<EOF
+PACKAGE_NAME="v4l2loopback"
+PACKAGE_VERSION="${ver}"
+BUILT_MODULE_NAME="v4l2loopback"
+DEST_MODULE_LOCATION="/extra"
+MAKE[0]="make KERNELRELEASE=\${kernelver}"
+CLEAN="make clean"
+AUTOINSTALL="yes"
+EOF
+    dkms add    "v4l2loopback/${ver}" 2>/dev/null || true
+    dkms build  "v4l2loopback/${ver}" -k "$KERN"
+    dkms install "v4l2loopback/${ver}" -k "$KERN"
+    rm -rf "$tmp"
+}
+
+# ── Phase 2: gc2607.ko via DKMS ───────────────────────────────────────
+setup_gc2607_dkms() {
+    log "=== Phase 2: Setting up gc2607.ko DKMS ==="
+
+    # Remove old DKMS entry if exists
+    dkms remove "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}" --all 2>/dev/null || true
+    rm -rf "$DKMS_GC2607_SRC"
+    mkdir -p "$DKMS_GC2607_SRC"
+
+    cp "$SCRIPT_DIR/gc2607.c" "$DKMS_GC2607_SRC/"
+
+    cat > "$DKMS_GC2607_SRC/Makefile" <<'EOF'
+obj-m := gc2607.o
+all:
+	$(MAKE) -C /lib/modules/$(KERNELRELEASE)/build M=$(PWD) modules
+clean:
+	$(MAKE) -C /lib/modules/$(KERNELRELEASE)/build M=$(PWD) clean
+EOF
+
+    cat > "$DKMS_GC2607_SRC/dkms.conf" <<EOF
+PACKAGE_NAME="${DKMS_GC2607_NAME}"
+PACKAGE_VERSION="${DKMS_GC2607_VER}"
+BUILT_MODULE_NAME="gc2607"
+BUILT_MODULE_LOCATION="."
+DEST_MODULE_LOCATION="/extra"
+MAKE[0]="make KERNELRELEASE=\${kernelver}"
+CLEAN="make clean"
+AUTOINSTALL="yes"
+EOF
+
+    dkms add     "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}"
+    dkms build   "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}" -k "$KERN"
+    dkms install "${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}" -k "$KERN" --force
+
+    log "gc2607.ko installed via DKMS"
+}
+
+# ── Phase 3: ipu_bridge patch via DKMS ────────────────────────────────
+setup_ipu_bridge() {
+    log "=== Phase 3: Patching ipu_bridge for GC2607 ==="
+
+    mkdir -p "$WORK_DIR"
+
+    # Download kernel source tarball (only once; reuse if valid)
+    if [ -f "$TARBALL" ]; then
+        log "Checking cached tarball..."
+        xz --test "$TARBALL" &>/dev/null || { warn "Corrupt tarball, re-downloading"; rm -f "$TARBALL"; }
+    fi
+
+    if [ ! -f "$TARBALL" ]; then
+        local url="https://cdn.kernel.org/pub/linux/kernel/v${KERN_MAJOR}.x/linux-${KERN_BASE}.tar.xz"
+        log "Downloading kernel source: $url"
+        wget --progress=bar:force -O "$TARBALL" "$url" || die "Download failed: $url"
+        xz --test "$TARBALL" &>/dev/null || die "Downloaded tarball is corrupt"
+    fi
+
+    # Extract only the intel IPU driver directory
+    log "Extracting ipu-bridge source..."
+    local ipu_src="$WORK_DIR/ipu_intel"
+    rm -rf "$ipu_src"
+    mkdir -p "$ipu_src"
+
+    tar xf "$TARBALL" \
+        --wildcards "linux-${KERN_BASE}/drivers/media/pci/intel/*" \
+        --strip-components=5 \
+        -C "$ipu_src" 2>/dev/null || \
+    tar xf "$TARBALL" \
+        --wildcards "linux-${KERN_BASE}/drivers/media/pci/intel*" \
+        --strip-components=4 \
+        -C "$ipu_src" 2>/dev/null || \
+        die "Could not extract intel/ directory from tarball"
+
+    # Find ipu-bridge.c
+    local src
+    src=$(find "$ipu_src" -name "ipu-bridge.c" | head -1)
+    [ -n "$src" ] || die "ipu-bridge.c not found in kernel source"
+    local src_dir
+    src_dir=$(dirname "$src")
+    log "Found ipu-bridge.c at: $src"
+
+    # Check if GCTI2607 already present (previous patch)
+    if grep -q "GCTI2607" "$src"; then
+        log "GCTI2607 already in source, skipping patch"
+    else
+        # Find the insertion point: after the last IPU_SENSOR_CONFIG line in ipu_sensors[]
+        log "Patching ipu-bridge.c with GC2607 support..."
+        if grep -q "IPU_SENSOR_CONFIG" "$src"; then
+            # Insert after the opening of ipu_sensors array or after first entry
+            sed -i '/IPU_SENSOR_CONFIG.*OV/a\\t/* GalaxyCore GC2607 */\n\tIPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),' "$src" || \
+            # Fallback: insert before closing }; of ipu_sensors array
+            python3 - "$src" <<'PYEOF'
+import sys, re
+content = open(sys.argv[1]).read()
+# Find ipu_sensors array and add GCTI2607 before closing };
+pattern = r'(static const struct ipu_sensor_config.*?ipu_sensors\[\][^{]*\{)(.*?)(\};)'
+def add_entry(m):
+    body = m.group(2)
+    if 'GCTI2607' not in body:
+        body = body.rstrip() + '\n\t/* GalaxyCore GC2607 */\n\tIPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),\n'
+    return m.group(1) + body + m.group(3)
+new = re.sub(pattern, add_entry, content, flags=re.DOTALL)
+open(sys.argv[1], 'w').write(new)
+PYEOF
+        else
+            die "Cannot find IPU_SENSOR_CONFIG in ipu-bridge.c. Run install.sh again after checking kernel version."
+        fi
+
+        grep -q "GCTI2607" "$src" || die "Patch failed: GCTI2607 not found after patch"
+        log "Patch applied"
+    fi
+
+    # Set up DKMS for ipu_bridge
+    dkms remove "${DKMS_IPU_NAME}/${DKMS_IPU_VER}" --all 2>/dev/null || true
+    rm -rf "$DKMS_IPU_SRC"
+    mkdir -p "$DKMS_IPU_SRC"
+
+    # Copy all intel driver source files (ipu_bridge needs its headers)
+    cp "$src_dir"/*.c "$DKMS_IPU_SRC/" 2>/dev/null || true
+    cp "$src_dir"/*.h "$DKMS_IPU_SRC/" 2>/dev/null || true
+
+    cat > "$DKMS_IPU_SRC/Makefile" <<'EOF'
+# Build only ipu_bridge module
+obj-m := ipu_bridge.o
+ipu_bridge-objs := ipu-bridge.o
+
+KDIR := /lib/modules/$(KERNELRELEASE)/build
+
+all:
+	cp $(KDIR)/Module.symvers . 2>/dev/null || true
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+EOF
+
+    cat > "$DKMS_IPU_SRC/dkms.conf" <<EOF
+PACKAGE_NAME="${DKMS_IPU_NAME}"
+PACKAGE_VERSION="${DKMS_IPU_VER}"
+BUILT_MODULE_NAME="ipu_bridge"
+BUILT_MODULE_LOCATION="."
+DEST_MODULE_LOCATION="/updates/dkms"
+MAKE[0]="make KERNELRELEASE=\${kernelver}"
+CLEAN="make clean"
+AUTOINSTALL="yes"
+EOF
+
+    dkms add     "${DKMS_IPU_NAME}/${DKMS_IPU_VER}"
+    dkms build   "${DKMS_IPU_NAME}/${DKMS_IPU_VER}" -k "$KERN" || \
+        die "DKMS build of ipu_bridge failed. Check: dkms status"
+    dkms install "${DKMS_IPU_NAME}/${DKMS_IPU_VER}" -k "$KERN" --force
+
+    # Compress installed module with crc32 (required by Fedora kernel loader)
+    compress_ipu_bridge
+
+    log "ipu_bridge patched and installed via DKMS"
+}
+
+compress_ipu_bridge() {
+    # Fedora's kernel loader requires xz with CRC32 checksum.
+    # DKMS installs .ko uncompressed or with default CRC64 — fix it.
+    local mod_paths
+    mod_paths=$(find "/lib/modules/${KERN}" \
+        \( -name "ipu_bridge.ko" -o -name "ipu_bridge.ko.xz" \) \
+        -not -name "*.bak" 2>/dev/null | head -5)
+
+    [ -n "$mod_paths" ] || { warn "ipu_bridge.ko not found to compress"; return; }
+
+    for path in $mod_paths; do
+        local dir base ko_path
+        dir=$(dirname "$path")
+        base=$(basename "$path" .xz)
+        ko_path="$dir/$base"
+
+        # Decompress if needed
+        if [[ "$path" == *.xz ]]; then
+            xz -d -f "$path" || continue
+        fi
+
+        [ -f "$ko_path" ] || continue
+
+        # Backup original kernel module (only once)
+        local orig="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
+        if [ -f "$orig" ] && [ ! -f "${BACKUP_DIR}/ipu_bridge.ko.xz.orig" ]; then
+            mkdir -p "$BACKUP_DIR"
+            cp "$orig" "${BACKUP_DIR}/ipu_bridge.ko.xz.orig"
+            log "Backed up original ipu_bridge.ko.xz"
+        fi
+
+        # Compress with CRC32
+        xz -9 --check=crc32 -f -k "$ko_path"
+        local xz_path="${ko_path}.xz"
+
+        # Install to correct location (updates/dkms takes priority over kernel/)
+        local dst="$dir/$(basename "$ko_path").xz"
+        cp "$xz_path" "$dst"
+        rm -f "$ko_path" "$xz_path"
+        log "Compressed and installed: $dst"
+    done
+
+    depmod -a "$KERN"
+}
+
+# ── Phase 4: Build gc2607_isp ──────────────────────────────────────────
+build_isp() {
+    log "=== Phase 4: Building gc2607_isp ==="
+
+    gcc -O2 -Wall -Wextra -march=native \
+        -o "$SCRIPT_DIR/gc2607_isp" \
+        "$SCRIPT_DIR/gc2607_isp.c" \
+        -lm || die "Failed to build gc2607_isp"
+
+    log "Build OK: $(ls -lh "$SCRIPT_DIR/gc2607_isp")"
+}
+
+# ── Phase 5: Install to /opt/gc2607/ ──────────────────────────────────
+install_files() {
+    log "=== Phase 5: Installing to $INSTALL_DIR ==="
+
+    mkdir -p "$INSTALL_DIR"
+
+    cp "$SCRIPT_DIR/gc2607_isp"                    "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607_virtualcam.py"          "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607-service.sh"             "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
+
+    chmod +x "$INSTALL_DIR/gc2607_isp"
+    chmod +x "$INSTALL_DIR/gc2607-service.sh"
+    chmod +x "$INSTALL_DIR/gc2607-restart-wireplumber.sh"
+    chmod +x "$INSTALL_DIR/gc2607_virtualcam.py"
+
+    # Fix SCRIPT_DIR inside service script
+    sed -i "s|^SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" \
+        "$INSTALL_DIR/gc2607-service.sh"
+
+    log "Files installed"
+}
+
+# ── Phase 6: Config file ───────────────────────────────────────────────
+install_config() {
+    log "=== Phase 6: Camera config ==="
+
+    mkdir -p /etc/gc2607
+
+    if [ ! -f "$CONF_FILE" ]; then
+        cat > "$CONF_FILE" <<'EOF'
+# GC2607 ISP settings
+# Edit and run: sudo systemctl restart gc2607-camera.service
+#
+# resolution  — 1920x1080 (default) or 960x540 (less CPU)
+# fps         — output fps 1-30 (default: 30)
+# brightness  — AE target brightness 0-255 (default: 100)
+# saturation  — color saturation, 100=neutral (default: 100)
+# wb          — white balance: auto, daylight, cloudy, shade,
+#               tungsten, fluorescent, manual (default: auto)
+# wb_red      — red gain for wb=manual (e.g. 1.8)
+# wb_blue     — blue gain for wb=manual (e.g. 1.6)
+
+resolution=1920x1080
+fps=30
+brightness=100
+saturation=100
+wb=auto
+EOF
+        log "Created $CONF_FILE"
+    else
+        log "Keeping existing $CONF_FILE"
+    fi
+}
+
+# ── Phase 7: Wireplumber config ────────────────────────────────────────
+install_wireplumber() {
+    log "=== Phase 7: Wireplumber config ==="
+
+    local user; user=$(real_user)
+    local home; home=$(real_home)
+    local uid; uid=$(real_uid)
+    local gid; gid=$(real_gid)
+    local wpdir="${home}/.config/wireplumber/wireplumber.conf.d"
+
+    [ -n "$user" ] || { warn "Could not determine user, skipping wireplumber config"; return; }
+
+    mkdir -p "$wpdir"
+    cat > "${wpdir}/50-hide-ipu6-raw.conf" <<'EOF'
+monitor.v4l2.rules = [
+  {
+    matches = [
+      {
+        device.name = "~v4l2_device.pci-*"
+      }
+    ]
+    actions = {
+      update-props = {
+        device.disabled = true
+      }
+    }
+  }
+]
+EOF
+    chown -R "${uid}:${gid}" "${home}/.config/wireplumber"
+    log "Wireplumber config installed for user: $user"
+}
+
+# ── Phase 8: Systemd service ───────────────────────────────────────────
+install_service() {
+    log "=== Phase 8: Systemd service ==="
+
+    cat > /etc/systemd/system/gc2607-camera.service <<EOF
+[Unit]
+Description=GC2607 Camera Virtual Webcam
+After=multi-user.target graphical.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/gc2607-service.sh
+ExecStartPost=${INSTALL_DIR}/gc2607-restart-wireplumber.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable gc2607-camera.service
+    log "Service installed and enabled"
+}
+
+# ── Phase 9: Sign modules (Secure Boot) ───────────────────────────────
+sign_modules() {
+    # Skip if Secure Boot is not enabled
+    if ! mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
+        log "Secure Boot not active, skipping signing"
+        return
+    fi
+
+    log "=== Secure Boot detected: signing modules ==="
+
+    local mok_key="/var/lib/shim-signed/mok/MOK.priv"
+    local mok_cert="/var/lib/shim-signed/mok/MOK.der"
+
+    if [ ! -f "$mok_key" ]; then
+        log "Generating MOK key pair..."
+        mkdir -p /var/lib/shim-signed/mok
+        openssl req -new -x509 -newkey rsa:2048 -keyout "$mok_key" \
+            -out "$mok_cert" -days 3650 -subj "/CN=GC2607 Driver MOK/" \
+            -nodes 2>/dev/null
+        mokutil --import "$mok_cert"
+        log ""
+        log "  *** MOK key created. You must enroll it: ***"
+        log "  1. Reboot and look for 'Perform MOK management' screen"
+        log "  2. Select 'Enroll MOK' → 'Continue' → enter password"
+        log "  3. After reboot, run install.sh again to complete signing"
+        exit 0
+    fi
+
+    local sign_cmd="/lib/modules/${KERN}/build/scripts/sign-file"
+    [ -f "$sign_cmd" ] || sign_cmd="$(which sign-file 2>/dev/null)" || \
+        { warn "sign-file not found, modules not signed"; return; }
+
+    for ko in $(find "/lib/modules/${KERN}" -name "gc2607.ko" -o \
+                     -name "ipu_bridge.ko" 2>/dev/null); do
+        "$sign_cmd" sha256 "$mok_key" "$mok_cert" "$ko"
+        log "Signed: $ko"
+    done
+}
+
+# ── Phase 10: Load modules and start service ───────────────────────────
+start_camera() {
+    log "=== Phase 10: Starting camera ==="
+
+    # Unload stale modules
+    systemctl stop gc2607-camera.service 2>/dev/null || true
+    for mod in gc2607 ipu_bridge intel-ipu6-isys intel-ipu6; do
+        modprobe -r "$mod" 2>/dev/null || true
+    done
+    sleep 1
+
+    # Load stack
+    modprobe intel-ipu6    || warn "intel-ipu6 load failed (may already be built-in)"
+    modprobe ipu_bridge    || die "ipu_bridge load failed. Check: dmesg | tail -20"
+
+    # Verify GCTI2607 is recognized
+    if ! dmesg | tail -30 | grep -qi "GCTI2607\|gc2607"; then
+        warn "GC2607 not visible in dmesg yet (may appear after gc2607.ko loads)"
+    fi
+
+    modprobe gc2607 2>/dev/null || insmod "$(find /lib/modules/$KERN -name 'gc2607.ko*' | head -1)" || \
+        die "gc2607 module load failed"
+
+    sleep 2
+    systemctl start gc2607-camera.service
+
+    log "Waiting for service (10s)..."
+    sleep 10
+
+    # Restart wireplumber for current user
+    local user; user=$(real_user)
+    local uid; uid=$(real_uid)
+    if [ -n "$user" ] && [ "$uid" -ne 0 ]; then
+        su - "$user" -c \
+            "XDG_RUNTIME_DIR=/run/user/${uid} systemctl --user restart wireplumber" \
+            2>/dev/null || true
+    fi
+}
+
+# ── Phase 11: Save state ───────────────────────────────────────────────
+save_state() {
+    mkdir -p "$STATE_DIR"
+    cat > "$STATE_FILE" <<EOF
+install_date=$(date -Iseconds)
+kernel=${KERN}
+kern_base=${KERN_BASE}
+install_dir=${INSTALL_DIR}
+dkms_gc2607=${DKMS_GC2607_NAME}/${DKMS_GC2607_VER}
+dkms_ipu=${DKMS_IPU_NAME}/${DKMS_IPU_VER}
+EOF
+    log "State saved to $STATE_FILE"
+}
+
+# ── Status report ──────────────────────────────────────────────────────
+show_status() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if systemctl is-active --quiet gc2607-camera.service; then
+        echo -e "${GREEN}✓ Camera service is running${NC}"
+        echo ""
+        echo "  Open camera app and select 'GC2607 Camera'"
+    else
+        echo -e "${RED}✗ Camera service is NOT running${NC}"
+        echo ""
+        echo "  Check logs: journalctl -u gc2607-camera.service -n 30"
+    fi
+    echo ""
+    echo "  Config:   $CONF_FILE"
+    echo "  Restart:  sudo systemctl restart gc2607-camera.service"
+    echo "  Logs:     journalctl -u gc2607-camera.service -f"
+    echo "  DKMS:     dkms status"
+    echo ""
+    echo "  After kernel update: sudo ./install.sh  (DKMS usually handles it)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# ── Main ───────────────────────────────────────────────────────────────
+main() {
+    require_root
+
+    log "GC2607 Camera Driver Installer"
+    log "Kernel: $KERN"
+    log "User:   $(real_user)"
+
+    install_deps
+    setup_gc2607_dkms
+    setup_ipu_bridge
+    build_isp
+    install_files
+    install_config
+    install_wireplumber
+    install_service
+    sign_modules
+    start_camera
+    save_state
+    show_status
+}
+
+main "$@"
