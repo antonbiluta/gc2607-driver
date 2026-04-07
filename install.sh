@@ -189,26 +189,49 @@ setup_ipu_bridge() {
         xz --test "$TARBALL" &>/dev/null || die "Downloaded tarball is corrupt"
     fi
 
-    # Extract only the intel IPU driver directory
-    log "Extracting ipu-bridge source..."
+    # Extract intel IPU driver directory using Python for reliable path detection
+    log "Locating ipu-bridge source in tarball..."
     local ipu_src="$WORK_DIR/ipu_intel"
     rm -rf "$ipu_src"
     mkdir -p "$ipu_src"
 
-    tar xf "$TARBALL" \
-        --wildcards "linux-${KERN_BASE}/drivers/media/pci/intel/*" \
-        --strip-components=5 \
-        -C "$ipu_src" 2>/dev/null || \
-    tar xf "$TARBALL" \
-        --wildcards "linux-${KERN_BASE}/drivers/media/pci/intel*" \
-        --strip-components=4 \
-        -C "$ipu_src" 2>/dev/null || \
-        die "Could not extract intel/ directory from tarball"
+    python3 - "$TARBALL" "$ipu_src" <<'PYEOF'
+import sys, os, tarfile
 
-    # Find ipu-bridge.c
+tarball, dest = sys.argv[1], sys.argv[2]
+
+# First pass: find the directory containing ipu-bridge.c
+intel_prefix = None
+print("[gc2607] Scanning tarball for ipu-bridge.c ...")
+with tarfile.open(tarball, "r:xz") as tf:
+    for member in tf:
+        if member.name.endswith("/ipu-bridge.c") or member.name == "ipu-bridge.c":
+            intel_prefix = member.name[: -len("ipu-bridge.c")]
+            print(f"[gc2607] Found at: {member.name}")
+            break
+
+if intel_prefix is None:
+    print("[gc2607] ERROR: ipu-bridge.c not found in tarball", file=sys.stderr)
+    sys.exit(1)
+
+# Second pass: extract all files from that directory
+count = 0
+with tarfile.open(tarball, "r:xz") as tf:
+    for member in tf:
+        if member.name.startswith(intel_prefix) and member.isfile():
+            member.name = os.path.basename(member.name)
+            tf.extract(member, dest, set_attrs=False)
+            count += 1
+
+print(f"[gc2607] Extracted {count} files to {dest}")
+PYEOF
+
+    [ $? -eq 0 ] || die "Failed to extract ipu-bridge source from tarball"
+
+    # Find ipu-bridge.c (should be directly in ipu_src now)
     local src
     src=$(find "$ipu_src" -name "ipu-bridge.c" | head -1)
-    [ -n "$src" ] || die "ipu-bridge.c not found in kernel source"
+    [ -n "$src" ] || die "ipu-bridge.c not found after extraction"
     local src_dir
     src_dir=$(dirname "$src")
     log "Found ipu-bridge.c at: $src"
@@ -219,26 +242,38 @@ setup_ipu_bridge() {
     else
         # Find the insertion point: after the last IPU_SENSOR_CONFIG line in ipu_sensors[]
         log "Patching ipu-bridge.c with GC2607 support..."
-        if grep -q "IPU_SENSOR_CONFIG" "$src"; then
-            # Insert after the opening of ipu_sensors array or after first entry
-            sed -i '/IPU_SENSOR_CONFIG.*OV/a\\t/* GalaxyCore GC2607 */\n\tIPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),' "$src" || \
-            # Fallback: insert before closing }; of ipu_sensors array
-            python3 - "$src" <<'PYEOF'
+        python3 - "$src" <<'PYEOF'
 import sys, re
-content = open(sys.argv[1]).read()
-# Find ipu_sensors array and add GCTI2607 before closing };
-pattern = r'(static const struct ipu_sensor_config.*?ipu_sensors\[\][^{]*\{)(.*?)(\};)'
-def add_entry(m):
-    body = m.group(2)
-    if 'GCTI2607' not in body:
-        body = body.rstrip() + '\n\t/* GalaxyCore GC2607 */\n\tIPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),\n'
-    return m.group(1) + body + m.group(3)
-new = re.sub(pattern, add_entry, content, flags=re.DOTALL)
-open(sys.argv[1], 'w').write(new)
+
+path = sys.argv[1]
+content = open(path).read()
+
+if 'GCTI2607' in content:
+    print("[gc2607] Already patched")
+    sys.exit(0)
+
+gc2607_entry = '\n\t/* GalaxyCore GC2607 */\n\tIPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),'
+
+# Strategy 1: insert after an existing IPU_SENSOR_CONFIG line
+if 'IPU_SENSOR_CONFIG' in content:
+    # Find last IPU_SENSOR_CONFIG(...), entry and append after it
+    new = re.sub(
+        r'(IPU_SENSOR_CONFIG\([^)]+\)\s*,)',
+        lambda m, _last=[None]: (setattr(_last, 'v', m.group(0)) or m.group(0)),
+        content
+    )
+    # Insert after the LAST IPU_SENSOR_CONFIG entry
+    pos = content.rfind('IPU_SENSOR_CONFIG')
+    end = content.find(',', pos)
+    if end != -1:
+        content = content[:end+1] + gc2607_entry + content[end+1:]
+        open(path, 'w').write(content)
+        print("[gc2607] Patched: inserted after last IPU_SENSOR_CONFIG entry")
+        sys.exit(0)
+
+print("[gc2607] ERROR: No IPU_SENSOR_CONFIG found in ipu-bridge.c", file=sys.stderr)
+sys.exit(1)
 PYEOF
-        else
-            die "Cannot find IPU_SENSOR_CONFIG in ipu-bridge.c. Run install.sh again after checking kernel version."
-        fi
 
         grep -q "GCTI2607" "$src" || die "Patch failed: GCTI2607 not found after patch"
         log "Patch applied"
