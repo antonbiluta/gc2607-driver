@@ -324,48 +324,64 @@ EOF
 }
 
 compress_ipu_bridge() {
-    # Fedora's kernel loader requires xz with CRC32 checksum.
-    # DKMS installs .ko uncompressed or with default CRC64 — fix it.
-    local mod_paths
-    mod_paths=$(find "/lib/modules/${KERN}" \
-        \( -name "ipu_bridge.ko" -o -name "ipu_bridge.ko.xz" \) \
-        -not -name "*.bak" 2>/dev/null | head -5)
+    # Fedora kernel loader requires xz with CRC32 (not CRC64).
+    # DKMS usually gets this right, but verify and fix if needed.
 
-    [ -n "$mod_paths" ] || { warn "ipu_bridge.ko not found to compress"; return; }
+    # Backup original in-kernel ipu_bridge (only once)
+    local orig="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
+    if [ -f "$orig" ] && [ ! -f "${BACKUP_DIR}/ipu_bridge.ko.xz.orig" ]; then
+        mkdir -p "$BACKUP_DIR"
+        cp "$orig" "${BACKUP_DIR}/ipu_bridge.ko.xz.orig"
+        log "Backed up original ipu_bridge.ko.xz"
+    fi
 
-    for path in $mod_paths; do
-        local dir base ko_path
-        dir=$(dirname "$path")
-        base=$(basename "$path" .xz)
-        ko_path="$dir/$base"
+    # Find the DKMS-installed module (in extra/ or updates/dkms/)
+    local mod
+    mod=$(find "/lib/modules/${KERN}" \
+        \( -path "*/extra/ipu_bridge.ko.xz" \
+        -o -path "*/updates/dkms/ipu_bridge.ko.xz" \
+        -o -name "ipu_bridge.ko" \) \
+        -not -name "*.bak" 2>/dev/null | head -1)
 
-        # Decompress if needed
-        if [[ "$path" == *.xz ]]; then
-            xz -d -f "$path" || continue
-        fi
+    [ -n "$mod" ] || { warn "ipu_bridge module not found after DKMS install"; return; }
+    log "Checking module: $mod"
 
-        [ -f "$ko_path" ] || continue
+    # If uncompressed .ko — compress it in place
+    if [[ "$mod" != *.xz ]]; then
+        warn "Module is uncompressed, compressing with CRC32..."
+        xz -9 --check=crc32 -f "$mod"
+        mod="${mod}.xz"
+        depmod -a "$KERN"
+        log "Compressed: $mod"
+        return
+    fi
 
-        # Backup original kernel module (only once)
-        local orig="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
-        if [ -f "$orig" ] && [ ! -f "${BACKUP_DIR}/ipu_bridge.ko.xz.orig" ]; then
-            mkdir -p "$BACKUP_DIR"
-            cp "$orig" "${BACKUP_DIR}/ipu_bridge.ko.xz.orig"
-            log "Backed up original ipu_bridge.ko.xz"
-        fi
+    # If .xz — check CRC type (CRC32 required, CRC64 is wrong)
+    local crc_type
+    crc_type=$(xz --robot -lv "$mod" 2>/dev/null | awk '/^file/{print $8}')
+    log "Module compression check: $crc_type"
 
-        # Compress with CRC32
-        xz -9 --check=crc32 -f -k "$ko_path"
-        local xz_path="${ko_path}.xz"
+    if [ "$crc_type" = "CRC32" ]; then
+        log "CRC32 confirmed — no recompression needed"
+        return
+    fi
 
-        # Install to correct location (updates/dkms takes priority over kernel/)
-        local dst="$dir/$(basename "$ko_path").xz"
-        cp "$xz_path" "$dst"
-        rm -f "$ko_path" "$xz_path"
-        log "Compressed and installed: $dst"
-    done
+    warn "Module uses $crc_type instead of CRC32 — recompressing..."
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    xz -d -c "$mod" > "$tmpdir/ipu_bridge.ko" \
+        || { rm -rf "$tmpdir"; die "Failed to decompress $mod"; }
+
+    xz -9 --check=crc32 "$tmpdir/ipu_bridge.ko" \
+        || { rm -rf "$tmpdir"; die "Failed to recompress with CRC32"; }
+
+    # Overwrite in-place (avoids cp same-file error)
+    cp "$tmpdir/ipu_bridge.ko.xz" "$mod"
+    rm -rf "$tmpdir"
 
     depmod -a "$KERN"
+    log "Recompressed with CRC32: $mod"
 }
 
 # ── Phase 4: Build gc2607_isp ──────────────────────────────────────────
