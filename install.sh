@@ -220,7 +220,10 @@ with tarfile.open(tarball, "r:xz") as tf:
     for member in tf:
         if member.name.startswith(intel_prefix) and member.isfile():
             member.name = os.path.basename(member.name)
-            tf.extract(member, dest, set_attrs=False)
+            try:
+                tf.extract(member, dest, set_attrs=False, filter='data')
+            except TypeError:
+                tf.extract(member, dest, set_attrs=False)
             count += 1
 
 print(f"[gc2607] Extracted {count} files to {dest}")
@@ -243,36 +246,32 @@ PYEOF
         # Find the insertion point: after the last IPU_SENSOR_CONFIG line in ipu_sensors[]
         log "Patching ipu-bridge.c with GC2607 support..."
         python3 - "$src" <<'PYEOF'
-import sys, re
+import sys
 
 path = sys.argv[1]
-content = open(path).read()
+lines = open(path).readlines()
 
-if 'GCTI2607' in content:
+if any('GCTI2607' in l for l in lines):
     print("[gc2607] Already patched")
     sys.exit(0)
 
-gc2607_entry = '\n\t/* GalaxyCore GC2607 */\n\tIPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),'
+# Find the last line containing IPU_SENSOR_CONFIG and insert after it
+last_idx = None
+for i, line in enumerate(lines):
+    if 'IPU_SENSOR_CONFIG' in line:
+        last_idx = i
 
-# Strategy 1: insert after an existing IPU_SENSOR_CONFIG line
-if 'IPU_SENSOR_CONFIG' in content:
-    # Find last IPU_SENSOR_CONFIG(...), entry and append after it
-    new = re.sub(
-        r'(IPU_SENSOR_CONFIG\([^)]+\)\s*,)',
-        lambda m, _last=[None]: (setattr(_last, 'v', m.group(0)) or m.group(0)),
-        content
-    )
-    # Insert after the LAST IPU_SENSOR_CONFIG entry
-    pos = content.rfind('IPU_SENSOR_CONFIG')
-    end = content.find(',', pos)
-    if end != -1:
-        content = content[:end+1] + gc2607_entry + content[end+1:]
-        open(path, 'w').write(content)
-        print("[gc2607] Patched: inserted after last IPU_SENSOR_CONFIG entry")
-        sys.exit(0)
+if last_idx is None:
+    print("[gc2607] ERROR: IPU_SENSOR_CONFIG not found in ipu-bridge.c", file=sys.stderr)
+    sys.exit(1)
 
-print("[gc2607] ERROR: No IPU_SENSOR_CONFIG found in ipu-bridge.c", file=sys.stderr)
-sys.exit(1)
+entry = [
+    '\t/* GalaxyCore GC2607 */\n',
+    '\tIPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),\n',
+]
+lines = lines[:last_idx + 1] + entry + lines[last_idx + 1:]
+open(path, 'w').writelines(lines)
+print(f"[gc2607] Patched: inserted GC2607 entry after line {last_idx + 1}")
 PYEOF
 
         grep -q "GCTI2607" "$src" || die "Patch failed: GCTI2607 not found after patch"
