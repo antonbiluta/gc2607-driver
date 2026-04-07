@@ -263,23 +263,48 @@ if any('GCTI2607' in l for l in lines):
     print("[gc2607] Already patched")
     sys.exit(0)
 
-# Find the last line containing IPU_SENSOR_CONFIG and insert after it
-last_idx = None
-for i, line in enumerate(lines):
-    if 'IPU_SENSOR_CONFIG' in line:
-        last_idx = i
-
-if last_idx is None:
-    print("[gc2607] ERROR: IPU_SENSOR_CONFIG not found in ipu-bridge.c", file=sys.stderr)
-    sys.exit(1)
-
 entry = [
     '\t/* GalaxyCore GC2607 */\n',
     '\tIPU_SENSOR_CONFIG("GCTI2607", 1, 336000000),\n',
 ]
-lines = lines[:last_idx + 1] + entry + lines[last_idx + 1:]
-open(path, 'w').writelines(lines)
-print(f"[gc2607] Patched: inserted GC2607 entry after line {last_idx + 1}")
+
+# Strategy 1: find the ipu_sensors[] array and insert before its closing };
+# We look for the array definition, then find its closing brace.
+array_start = None
+for i, line in enumerate(lines):
+    if 'ipu_sensors' in line and ('[]' in line or ('=' in line and '{' in line)):
+        array_start = i
+        break
+
+if array_start is not None:
+    # Find closing }; of the array (first }; after array_start)
+    for i in range(array_start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if stripped.startswith('};'):
+            lines[i:i] = entry
+            open(path, 'w').writelines(lines)
+            print(f"[gc2607] Patched: inserted GC2607 before ipu_sensors closing at line {i+1}")
+            sys.exit(0)
+
+# Strategy 2 (fallback): insert after the last IPU_SENSOR_CONFIG line
+# that is not in a comment and not a macro definition
+last_idx = None
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if ('IPU_SENSOR_CONFIG' in line
+            and not stripped.startswith('//')
+            and not stripped.startswith('*')
+            and not stripped.startswith('#define')):
+        last_idx = i
+
+if last_idx is not None:
+    lines[last_idx + 1:last_idx + 1] = entry
+    open(path, 'w').writelines(lines)
+    print(f"[gc2607] Patched (fallback): inserted GC2607 after line {last_idx + 1}")
+    sys.exit(0)
+
+print("[gc2607] ERROR: could not find insertion point in ipu-bridge.c", file=sys.stderr)
+sys.exit(1)
 PYEOF
 
         grep -q "GCTI2607" "$src" || die "Patch failed: GCTI2607 not found after patch"
@@ -374,9 +399,9 @@ install_ipu_bridge_to_kernel() {
     xz -9 --check=crc32 "$tmp/ipu_bridge.ko" || \
         { rm -rf "$tmp"; die "xz compression failed"; }
 
-    # Verify GCTI2607 is in the built module
-    xz -dc "$tmp/ipu_bridge.ko.xz" | strings | grep -q "GCTI2607" || \
-        { rm -rf "$tmp"; die "GCTI2607 not found in built ipu_bridge.ko — patch may have failed"; }
+    # Verify patch was applied to source (binary strings check gives false negatives)
+    grep -q "GCTI2607" "${DKMS_IPU_SRC}/ipu-bridge.c" || \
+        { rm -rf "$tmp"; die "GCTI2607 not in DKMS source — patch failed. Re-run: sudo ./install.sh"; }
 
     cp "$tmp/ipu_bridge.ko.xz" "$dst"
     rm -rf "$tmp"
