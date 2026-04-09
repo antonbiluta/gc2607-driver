@@ -77,24 +77,50 @@ if ! grep -q "^gc2607 " /proc/modules; then
         insmod "$(find /lib/modules/${KVER} -name 'gc2607.ko*' | head -1)" || \
         die "gc2607.ko not found or failed to load"
 fi
-sleep 2
+
+# Wait for udev to finish processing hardware events and async subdev registration
+udevadm settle --timeout=10 2>/dev/null || true
+sleep 3
 
 # ── Verify Sensor ───────────────────────────────────────────────────
 
 if ! grep -q "^gc2607 " /proc/modules; then
+    log "ERROR: gc2607 module not loaded. dmesg:"
+    dmesg | grep -i "gc2607\|GCTI2607" | tail -10 || true
     die "gc2607 module not loaded"
 fi
+log "gc2607 module loaded OK"
 
+# Retry topology check — async subdev registration may take a few seconds
 MEDIA_DEV=""
-for dev in /dev/media*; do
-    if media-ctl -d "$dev" --print-topology 2>/dev/null | grep -qi "gc2607"; then
-        MEDIA_DEV="$dev"
-        break
-    fi
+for attempt in 1 2 3 4 5; do
+    for dev in /dev/media*; do
+        [ -e "$dev" ] || continue
+        if media-ctl -d "$dev" --print-topology 2>/dev/null | grep -qi "gc2607"; then
+            MEDIA_DEV="$dev"
+            break 2
+        fi
+    done
+    [ -z "$MEDIA_DEV" ] || break
+    log "Topology attempt $attempt/5: gc2607 not yet visible, waiting 3s..."
+    sleep 3
 done
 
 if [ -z "$MEDIA_DEV" ]; then
-    die "GC2607 not in media topology"
+    log "ERROR: GC2607 not in media topology after 5 attempts."
+    log "--- Loaded modules ---"
+    lsmod | grep -E "gc2607|ipu_bridge|intel.ipu" || true
+    log "--- ipu_bridge file ---"
+    modinfo -F filename ipu_bridge 2>/dev/null || true
+    log "--- gc2607 dmesg ---"
+    dmesg | grep -i "gc2607\|GCTI2607\|ipu_bridge" | tail -20 || true
+    log "--- Media topology ---"
+    for dev in /dev/media*; do
+        [ -e "$dev" ] || continue
+        log "  $dev:"
+        media-ctl -d "$dev" --print-topology 2>/dev/null | head -30 || true
+    done
+    die "GC2607 not in media topology. Check logs above."
 fi
 log "Sensor on $MEDIA_DEV"
 
