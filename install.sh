@@ -359,7 +359,20 @@ EOF
 }
 
 install_ipu_bridge_to_kernel() {
-    local dst="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
+    # Detect the real on-disk path — on Fedora 43+ the file is ipu-bridge.ko.xz (dash),
+    # on older kernels it may be ipu_bridge.ko.xz (underscore).
+    local dst
+    dst=$(modinfo -F filename ipu_bridge 2>/dev/null || true)
+    if [ -z "$dst" ]; then
+        dst=$(find "/lib/modules/${KERN}/kernel" \
+            \( -name "ipu_bridge.ko*" -o -name "ipu-bridge.ko*" \) \
+            2>/dev/null | head -1)
+    fi
+    if [ -z "$dst" ]; then
+        dst="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
+        warn "Could not detect ipu_bridge on-disk path, using fallback: $dst"
+    fi
+    log "Target path: $dst"
 
     # DKMS stores built modules in one of these locations depending on version
     local built
@@ -368,20 +381,21 @@ install_ipu_bridge_to_kernel() {
         2>/dev/null | head -1)
 
     if [ -z "$built" ]; then
-        # Also check build/ directory (some DKMS versions keep it there)
         built=$(find "/var/lib/dkms/${DKMS_IPU_NAME}" \
             \( -name "ipu_bridge.ko" -o -name "ipu_bridge.ko.xz" \) \
             2>/dev/null | head -1)
     fi
 
-    [ -n "$built" ] || die "DKMS build output not found. Searched: /var/lib/dkms/${DKMS_IPU_NAME}/. Try: find /var/lib/dkms/${DKMS_IPU_NAME} -name '*.ko*'"
+    [ -n "$built" ] || die "DKMS build output not found. Try: find /var/lib/dkms/${DKMS_IPU_NAME} -name '*.ko*'"
     log "Using built module: $built"
 
     # Backup original (only once)
-    if [ -f "$dst" ] && [ ! -f "${BACKUP_DIR}/ipu_bridge.ko.xz.orig" ]; then
+    local backup_name
+    backup_name="$(basename "$dst").orig"
+    if [ -f "$dst" ] && [ ! -f "${BACKUP_DIR}/${backup_name}" ]; then
         mkdir -p "$BACKUP_DIR"
-        cp "$dst" "${BACKUP_DIR}/ipu_bridge.ko.xz.orig"
-        log "Backed up original: $dst"
+        cp "$dst" "${BACKUP_DIR}/${backup_name}"
+        log "Backed up original: $dst → ${BACKUP_DIR}/${backup_name}"
     fi
 
     # Compress with CRC32 (required by Fedora kernel loader)
@@ -389,7 +403,6 @@ install_ipu_bridge_to_kernel() {
     tmp=$(mktemp -d)
 
     if [[ "$built" == *.xz ]]; then
-        # Already compressed — decompress first, then recompress with CRC32
         xz -dc "$built" > "$tmp/ipu_bridge.ko" || \
             { rm -rf "$tmp"; die "Failed to decompress $built"; }
     else
@@ -399,7 +412,7 @@ install_ipu_bridge_to_kernel() {
     xz -9 --check=crc32 "$tmp/ipu_bridge.ko" || \
         { rm -rf "$tmp"; die "xz compression failed"; }
 
-    # Verify patch was applied to source (binary strings check gives false negatives)
+    # Verify patch was applied to source
     grep -q "GCTI2607" "${DKMS_IPU_SRC}/ipu-bridge.c" || \
         { rm -rf "$tmp"; die "GCTI2607 not in DKMS source — patch failed. Re-run: sudo ./install.sh"; }
 
@@ -407,7 +420,7 @@ install_ipu_bridge_to_kernel() {
     rm -rf "$tmp"
 
     depmod -a "$KERN"
-    log "Installed patched ipu_bridge.ko.xz → $dst"
+    log "Installed patched module → $dst"
 }
 
 
