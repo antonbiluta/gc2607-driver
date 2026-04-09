@@ -484,6 +484,7 @@ fps=30
 brightness=100
 saturation=100
 wb=auto
+rotation=180
 EOF
         log "Created $CONF_FILE"
     else

@@ -68,6 +68,7 @@ static int   cfg_saturation= 100;    /* 100=neutral */
 static char  cfg_wb_mode[32] = "auto";
 static float cfg_wb_red    = 1.0f;   /* used when wb_mode=manual */
 static float cfg_wb_blue   = 1.0f;
+static int   cfg_rotation  = 180;    /* 0 or 180 — sensor is mounted upside-down */
 
 /* ── Derived at startup ─────────────────────────────────────────────── */
 static int OUT_W, OUT_H;
@@ -80,8 +81,27 @@ struct buffer { void *start; size_t length; };
 /* Max-size static buffers (1920x1080x2 for YUYV) */
 static uint8_t  lut_r[LUT_SIZE], lut_g[LUT_SIZE], lut_b[LUT_SIZE];
 static uint8_t  yuyv_buf[SENSOR_W * SENSOR_H * 2];
+static uint8_t  flip_buf[SENSOR_W * SENSOR_H * 2];
 
 static void signal_handler(int sig) { (void)sig; running = 0; }
+
+/* 180° rotation for YUYV: reverse row order + swap Y0/Y1 within each macropixel */
+static void rotate180_yuyv(const uint8_t *src, uint8_t *dst, int w, int h)
+{
+    int stride = w * 2; /* bytes per row in YUYV */
+    for (int y = 0; y < h; y++) {
+        const uint8_t *src_row = src + (h - 1 - y) * stride;
+        uint8_t       *dst_row = dst + y * stride;
+        for (int x = 0; x < w / 2; x++) {
+            int sx = (w / 2 - 1 - x) * 4; /* source macropixel, right to left */
+            int dx = x * 4;
+            dst_row[dx + 0] = src_row[sx + 2]; /* Y1 → Y0 */
+            dst_row[dx + 1] = src_row[sx + 1]; /* U  → U  */
+            dst_row[dx + 2] = src_row[sx + 0]; /* Y0 → Y1 */
+            dst_row[dx + 3] = src_row[sx + 3]; /* V  → V  */
+        }
+    }
+}
 
 static int xioctl(int fd, unsigned long req, void *arg)
 {
@@ -365,6 +385,8 @@ static void load_config(const char *path)
             cfg_wb_red = (float)atof(val);
         } else if (!strcmp(key,"wb_blue")) {
             cfg_wb_blue = (float)atof(val);
+        } else if (!strcmp(key,"rotation")) {
+            cfg_rotation = atoi(val);
         }
     }
     fclose(f);
@@ -380,6 +402,7 @@ static void apply_arg(const char *key, const char *val)
     } else if (!strcmp(key,"wb"))         { snprintf(cfg_wb_mode,sizeof(cfg_wb_mode),"%s",val);
     } else if (!strcmp(key,"wb_red"))     { cfg_wb_red     = (float)atof(val);
     } else if (!strcmp(key,"wb_blue"))    { cfg_wb_blue    = (float)atof(val);
+    } else if (!strcmp(key,"rotation"))   { cfg_rotation   = atoi(val);
     }
 }
 
@@ -593,9 +616,14 @@ int main(int argc, char *argv[])
             last_ae_time = now;
         }
 
-        /* Output */
+        /* Output (with optional 180° rotation) */
         size_t frame_bytes = (size_t)(OUT_W * OUT_H * 2);
-        ssize_t wr = write(out_fd, yuyv_buf, frame_bytes);
+        const uint8_t *out_ptr = yuyv_buf;
+        if (cfg_rotation == 180) {
+            rotate180_yuyv(yuyv_buf, flip_buf, OUT_W, OUT_H);
+            out_ptr = flip_buf;
+        }
+        ssize_t wr = write(out_fd, out_ptr, frame_bytes);
         if (wr < 0 && errno != EAGAIN) { perror("write output"); break; }
 
         if (xioctl(cap_fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF"); break; }
