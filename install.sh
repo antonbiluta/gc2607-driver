@@ -535,16 +535,16 @@ install_service() {
 
     cat > /etc/systemd/system/gc2607-camera.service <<EOF
 [Unit]
-Description=GC2607 Camera Virtual Webcam
-After=multi-user.target graphical.target
-Wants=multi-user.target
+Description=GC2607 Camera Driver Setup
+After=multi-user.target
+# Re-run if kernel modules change (e.g. after kernel update)
+ConditionPathExists=/lib/modules/${KERN}/kernel/drivers/media/i2c
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=${INSTALL_DIR}/gc2607-service.sh
 ExecStartPost=${INSTALL_DIR}/gc2607-restart-wireplumber.sh
-Restart=on-failure
-RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
@@ -596,92 +596,43 @@ sign_modules() {
     done
 }
 
-# ── Phase 10: Load modules and start service ───────────────────────────
-
-# Check if the currently loaded ipu_bridge has GC2607 support
-ipu_bridge_has_gc2607() {
-    local f
-    f=$(modinfo -F filename ipu_bridge 2>/dev/null) || return 1
-    if [[ "$f" == *.xz ]]; then
-        xz -dc "$f" 2>/dev/null | strings | grep -q "GCTI2607"
-    else
-        strings "$f" 2>/dev/null | grep -q "GCTI2607"
-    fi
-}
-
+# ── Phase 10: Start service ────────────────────────────────────────────
 start_camera() {
     log "=== Phase 10: Starting camera ==="
 
     systemctl stop gc2607-camera.service 2>/dev/null || true
     sleep 1
 
-    # If ipu_bridge is already loaded with GC2607 support (e.g. after reboot
-    # with our patched module), we do NOT need to reload modules — just start
-    # the service. Trying to unload busy IPU6 modules would fail anyway.
-    if grep -q "^ipu_bridge " /proc/modules && ipu_bridge_has_gc2607; then
-        log "Patched ipu_bridge already loaded — skipping module reload"
-
-        # Ensure gc2607 is loaded
-        if ! grep -q "^gc2607 " /proc/modules; then
-            modprobe gc2607 2>/dev/null || \
-                insmod "$(find /lib/modules/$KERN -name 'gc2607.ko*' | head -1)" || \
-                die "gc2607 load failed. Check: dmesg | tail -20"
-            sleep 1
-        fi
-
-        systemctl start gc2607-camera.service
-        log "Waiting for service (10s)..."
-        sleep 10
-    else
-        # Need to (re)load the full module stack with our patched ipu_bridge.
-        # Try to unload; if modules are busy, ask for reboot.
-        local need_reboot=0
-        for mod in gc2607 intel-ipu6-isys intel-ipu6 ipu_bridge; do
+    # Try to reload module stack so the newly built modules take effect.
+    # If modules are busy (e.g. another service holds them), suggest reboot.
+    local need_reboot=0
+    for mod in gc2607 intel-ipu6-isys intel-ipu6 ipu_bridge; do
+        if grep -q "^${mod} " /proc/modules 2>/dev/null; then
             if ! modprobe -r "$mod" 2>/dev/null; then
                 warn "Cannot unload $mod (device busy)"
                 need_reboot=1
             fi
-        done
-
-        if [ "$need_reboot" -eq 1 ]; then
-            echo ""
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo -e "${YELLOW}⚠  Installation complete. Reboot required.${NC}"
-            echo ""
-            echo "  Some modules are in use and cannot be reloaded live."
-            echo "  After reboot the camera service will start automatically."
-            echo ""
-            echo "  sudo reboot"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            save_state
-            exit 0
         fi
+    done
 
-        sleep 1
-
-        modprobe intel-ipu6 2>/dev/null || warn "intel-ipu6 load failed (may be built-in)"
-        modprobe ipu_bridge || die "ipu_bridge load failed. Check: dmesg | tail -20"
-        sleep 1
-
-        modprobe gc2607 2>/dev/null || \
-            insmod "$(find /lib/modules/$KERN -name 'gc2607.ko*' | head -1)" || \
-            die "gc2607 load failed. Check: dmesg | tail -20"
-        sleep 2
-
-        systemctl start gc2607-camera.service
-        log "Waiting for service (10s)..."
-        sleep 10
+    if [ "$need_reboot" -eq 1 ]; then
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo -e "${YELLOW}⚠  Installation complete. Reboot required.${NC}"
+        echo ""
+        echo "  Some modules are in use and cannot be reloaded live."
+        echo "  After reboot the camera will be ready automatically."
+        echo ""
+        echo "  sudo reboot"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        save_state
+        exit 0
     fi
 
-    # Restart wireplumber for current user
-    local user uid
-    user=$(real_user)
-    uid=$(real_uid)
-    if [ -n "$user" ] && [ "$uid" -ne 0 ]; then
-        su - "$user" -c \
-            "XDG_RUNTIME_DIR=/run/user/${uid} systemctl --user restart wireplumber" \
-            2>/dev/null || true
-    fi
+    systemctl start gc2607-camera.service || \
+        die "Service failed to start. Check: journalctl -u gc2607-camera.service -n 30"
+
+    log "Camera ready. LED activates only when an app opens the camera."
 }
 
 # ── Phase 11: Save state ───────────────────────────────────────────────
