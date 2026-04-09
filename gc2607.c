@@ -926,8 +926,13 @@ static int gc2607_probe(struct i2c_client *client)
 	/* Power off after detection */
 	pm_runtime_put(dev);
 
-	/* Register async subdev for IPU6 integration */
-	ret = v4l2_async_register_subdev(&gc2607->sd);
+	/* Register async subdev for IPU6 integration.
+	 * v4l2_async_register_subdev_sensor() is required on kernel 6.6+:
+	 * it parses fwnode endpoints so the ipu_bridge notifier can match
+	 * this sensor and create the media pipeline. The plain
+	 * v4l2_async_register_subdev() leaves the sensor orphaned.
+	 */
+	ret = v4l2_async_register_subdev_sensor(&gc2607->sd);
 	if (ret) {
 		dev_err(dev, "Failed to register async subdev: %d\n", ret);
 		goto err_power;
