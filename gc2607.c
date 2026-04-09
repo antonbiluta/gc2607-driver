@@ -560,11 +560,32 @@ static int gc2607_set_fmt(struct v4l2_subdev *sd,
 	return 0;
 }
 
+/* get_selection — required by libcamera to discover sensor pixel array size */
+static int gc2607_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP:
+		sel->r.top    = 0;
+		sel->r.left   = 0;
+		sel->r.width  = 1920;
+		sel->r.height = 1080;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct v4l2_subdev_pad_ops gc2607_pad_ops = {
-	.enum_mbus_code = gc2607_enum_mbus_code,
+	.enum_mbus_code  = gc2607_enum_mbus_code,
 	.enum_frame_size = gc2607_enum_frame_size,
-	.get_fmt = gc2607_get_fmt,
-	.set_fmt = gc2607_set_fmt,
+	.get_fmt         = gc2607_get_fmt,
+	.set_fmt         = gc2607_set_fmt,
+	.get_selection   = gc2607_get_selection,
 };
 
 /*
@@ -848,7 +869,7 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	/* Initialize control handler with V4L2 controls */
-	v4l2_ctrl_handler_init(&gc2607->ctrls, 4);
+	v4l2_ctrl_handler_init(&gc2607->ctrls, 6);
 
 	/* Link frequency control (required by IPU6) */
 	gc2607->link_freq = v4l2_ctrl_new_int_menu(&gc2607->ctrls,
@@ -888,6 +909,28 @@ static int gc2607_probe(struct i2c_client *client)
 					  GC2607_GAIN_MAX,
 					  GC2607_GAIN_STEP,
 					  GC2607_GAIN_DEFAULT);
+
+	/* HBLANK — mandatory for libcamera (blanking = HTS - active width) */
+	{
+		struct v4l2_ctrl *hblank;
+		hblank = v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
+					   V4L2_CID_HBLANK,
+					   2048 - 1920, 2048 - 1920, 1,
+					   2048 - 1920);
+		if (hblank)
+			hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	}
+
+	/* VBLANK — mandatory for libcamera (blanking = VTS - active height) */
+	{
+		struct v4l2_ctrl *vblank;
+		vblank = v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
+					   V4L2_CID_VBLANK,
+					   1335 - 1080, 1335 - 1080, 1,
+					   1335 - 1080);
+		if (vblank)
+			vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	}
 
 	gc2607->sd.ctrl_handler = &gc2607->ctrls;
 
