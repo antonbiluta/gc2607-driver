@@ -440,6 +440,10 @@ build_isp() {
 install_files() {
     log "=== Phase 5: Installing to $INSTALL_DIR ==="
 
+    # Stop service first — otherwise running gc2607_isp binary can't be overwritten
+    systemctl stop gc2607-camera.service 2>/dev/null || true
+    sleep 1
+
     mkdir -p "$INSTALL_DIR"
 
     cp "$SCRIPT_DIR/gc2607_isp"                    "$INSTALL_DIR/"
