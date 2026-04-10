@@ -49,13 +49,25 @@ find_capture_dev() {
     return 1
 }
 
-# ── Wait for v4l2loopback output device ────────────────────────────────
-log "Waiting for output device $OUTPUT_DEV..."
-for i in $(seq 1 15); do
-    [ -e "$OUTPUT_DEV" ] && break
-    sleep 2
-done
-[ -e "$OUTPUT_DEV" ] || die "$OUTPUT_DEV not found — is v4l2loopback loaded?"
+# ── Ensure v4l2loopback is loaded with correct parameters ──────────────
+if ! [ -e "$OUTPUT_DEV" ]; then
+    log "Loading v4l2loopback..."
+    # Remove stale instance (wrong video_nr) if present
+    modprobe -r v4l2loopback 2>/dev/null || true
+    sleep 0.5
+    if modprobe v4l2loopback video_nr=50 card_label="GC2607 Camera" exclusive_caps=1 2>/dev/null; then
+        log "v4l2loopback loaded"
+    else
+        # modprobe.d may have locked in different params — try without params
+        modprobe v4l2loopback 2>/dev/null || die "v4l2loopback failed to load. Install: sudo dnf install v4l2loopback"
+    fi
+    # Wait briefly for udev to create the node
+    for i in $(seq 1 10); do
+        [ -e "$OUTPUT_DEV" ] && break
+        sleep 1
+    done
+fi
+[ -e "$OUTPUT_DEV" ] || die "$OUTPUT_DEV still not found after loading v4l2loopback (modinfo: $(modinfo -F version v4l2loopback 2>/dev/null || echo 'not installed'))"
 
 # ── Wait for IPU6 media device with gc2607 ─────────────────────────────
 log "Waiting for gc2607 in media topology..."

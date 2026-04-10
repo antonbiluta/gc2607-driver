@@ -629,8 +629,7 @@ EOF
     cat > /etc/systemd/system/gc2607-isp.service <<EOF
 [Unit]
 Description=GC2607 ISP Pipeline (raw sensor → /dev/video50)
-After=gc2607-camera.service
-Requires=gc2607-camera.service
+After=gc2607-camera.service network.target
 
 [Service]
 Type=simple
