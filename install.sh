@@ -20,8 +20,10 @@ set -euo pipefail
 # ── Paths ──────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERN=$(uname -r)
-KERN_BASE=$(echo "$KERN" | grep -oP '^\d+\.\d+\.\d+')
-KERN_MAJOR=$(echo "$KERN" | cut -d. -f1)
+KERN_BASE=$(echo "$KERN" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+KERN_MAJOR=$(echo "$KERN_BASE" | cut -d. -f1)
+echo "$KERN_BASE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || \
+    { echo "[gc2607] ERROR: Could not parse kernel base version from: $KERN" >&2; exit 1; }
 
 INSTALL_DIR="/opt/gc2607"
 STATE_DIR="/var/lib/gc2607-driver"
@@ -39,12 +41,26 @@ DKMS_IPU_SRC="/usr/src/${DKMS_IPU_NAME}-${DKMS_IPU_VER}"
 
 WORK_DIR="$STATE_DIR/build"
 TARBALL="$WORK_DIR/linux-${KERN_BASE}.tar.xz"
+RUNTIME_VERIFY_WARN=0
 
 # ── Helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[gc2607]${NC} $*"; }
 warn() { echo -e "${YELLOW}[gc2607]${NC} $*"; }
 die()  { echo -e "${RED}[gc2607] ERROR:${NC} $*" >&2; exit 1; }
+
+wait_service_active() {
+    local svc="$1"
+    local timeout="${2:-25}"
+    local i
+    for i in $(seq 1 "$timeout"); do
+        if systemctl is-active --quiet "$svc"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
 
 require_root() {
     [ "$(id -u)" -eq 0 ] || die "Run with sudo: sudo $0"
@@ -66,14 +82,32 @@ install_deps() {
         log "Detected Fedora/RHEL (dnf)"
 
         # Basic build tools + kernel-devel for current kernel
-        dnf install -y \
+        if ! dnf install -y \
             gcc make \
             "kernel-devel-${KERN}" \
             elfutils-libelf-devel \
             dkms \
             wget \
+            tar \
+            xz \
+            python3 \
             v4l-utils \
-            2>/dev/null || true
+            openssl \
+            mokutil; then
+            warn "kernel-devel-${KERN} unavailable, retrying with generic kernel-devel"
+            dnf install -y \
+                gcc make \
+                kernel-devel \
+                elfutils-libelf-devel \
+                dkms \
+                wget \
+                tar \
+                xz \
+                python3 \
+                v4l-utils \
+                openssl \
+                mokutil || die "Failed to install required dependencies"
+        fi
 
         # v4l2loopback: try RPM Fusion, fallback to DKMS build
         if ! modinfo v4l2loopback &>/dev/null; then
@@ -104,6 +138,30 @@ install_deps() {
     # kernel-devel sanity check
     [ -d "/lib/modules/${KERN}/build" ] || \
         die "kernel-devel not found for ${KERN}. Install: sudo dnf install kernel-devel-${KERN}"
+
+    # Tooling sanity check
+    for cmd in dkms gcc make modprobe modinfo media-ctl v4l2-ctl xz python3; do
+        command -v "$cmd" >/dev/null 2>&1 || die "Missing required tool: $cmd"
+    done
+
+    # Write modprobe.d config so v4l2loopback always loads with video_nr=50
+    cat > /etc/modprobe.d/gc2607-v4l2loopback.conf <<'EOF'
+# GC2607 ISP output device — fixed single virtual cam at /dev/video50
+# exclusive_caps=0 keeps better compatibility with Chrome/PipeWire source detection.
+options v4l2loopback devices=1 video_nr=50 card_label="GC2607 Camera" exclusive_caps=0
+EOF
+    log "modprobe.d config written for v4l2loopback"
+
+    # Load it now so gc2607-isp.service doesn't have to wait
+    modprobe -r v4l2loopback 2>/dev/null || true
+    modprobe v4l2loopback || warn "v4l2loopback failed to load (will retry at boot)"
+
+    # Verify /dev/video50 appeared
+    if [ -e /dev/video50 ]; then
+        log "v4l2loopback OK: /dev/video50 ready"
+    else
+        warn "/dev/video50 not found yet — may appear after udev settles"
+    fi
 
     log "Dependencies OK"
 }
@@ -183,27 +241,36 @@ setup_ipu_bridge() {
     log "=== Phase 3: Patching ipu_bridge for GC2607 ==="
 
     mkdir -p "$WORK_DIR"
-
-    # Download kernel source tarball (only once; reuse if valid)
-    if [ -f "$TARBALL" ]; then
-        log "Checking cached tarball..."
-        xz --test "$TARBALL" &>/dev/null || { warn "Corrupt tarball, re-downloading"; rm -f "$TARBALL"; }
-    fi
-
-    if [ ! -f "$TARBALL" ]; then
-        local url="https://cdn.kernel.org/pub/linux/kernel/v${KERN_MAJOR}.x/linux-${KERN_BASE}.tar.xz"
-        log "Downloading kernel source: $url"
-        wget --progress=bar:force -O "$TARBALL" "$url" || die "Download failed: $url"
-        xz --test "$TARBALL" &>/dev/null || die "Downloaded tarball is corrupt"
-    fi
-
-    # Extract intel IPU driver directory using Python for reliable path detection
-    log "Locating ipu-bridge source in tarball..."
     local ipu_src="$WORK_DIR/ipu_intel"
     rm -rf "$ipu_src"
     mkdir -p "$ipu_src"
 
-    python3 - "$TARBALL" "$ipu_src" <<'PYEOF'
+    # Prefer local kernel-devel tree (works offline and matches Fedora kernel build)
+    local local_intel_src="/usr/src/kernels/${KERN}/drivers/media/pci/intel"
+    if [ -f "${local_intel_src}/ipu-bridge.c" ]; then
+        log "Using local kernel source: ${local_intel_src}"
+        cp "${local_intel_src}"/*.c "$ipu_src/" 2>/dev/null || true
+        cp "${local_intel_src}"/*.h "$ipu_src/" 2>/dev/null || true
+    fi
+
+    # Fallback: download vanilla kernel tree if local source is unavailable
+    if [ ! -f "${ipu_src}/ipu-bridge.c" ]; then
+        # Download kernel source tarball (only once; reuse if valid)
+        if [ -f "$TARBALL" ]; then
+            log "Checking cached tarball..."
+            xz --test "$TARBALL" &>/dev/null || { warn "Corrupt tarball, re-downloading"; rm -f "$TARBALL"; }
+        fi
+
+        if [ ! -f "$TARBALL" ]; then
+            local url="https://cdn.kernel.org/pub/linux/kernel/v${KERN_MAJOR}.x/linux-${KERN_BASE}.tar.xz"
+            log "Downloading kernel source: $url"
+            wget --progress=bar:force -O "$TARBALL" "$url" || die "Download failed: $url"
+            xz --test "$TARBALL" &>/dev/null || die "Downloaded tarball is corrupt"
+        fi
+
+        # Extract intel IPU driver directory using Python for reliable path detection
+        log "Locating ipu-bridge source in tarball..."
+        python3 - "$TARBALL" "$ipu_src" <<'PYEOF'
 import sys, os, tarfile
 
 tarball, dest = sys.argv[1], sys.argv[2]
@@ -237,7 +304,8 @@ with tarfile.open(tarball, "r:xz") as tf:
 print(f"[gc2607] Extracted {count} files to {dest}")
 PYEOF
 
-    [ $? -eq 0 ] || die "Failed to extract ipu-bridge source from tarball"
+        [ $? -eq 0 ] || die "Failed to extract ipu-bridge source from tarball"
+    fi
 
     # Find ipu-bridge.c (should be directly in ipu_src now)
     local src
@@ -452,11 +520,15 @@ install_files() {
     cp "$SCRIPT_DIR/gc2607-service.sh"             "$INSTALL_DIR/"
     cp "$SCRIPT_DIR/gc2607-isp-start.sh"           "$INSTALL_DIR/"
     cp "$SCRIPT_DIR/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607-settings"               "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607-settings-helper.sh"     "$INSTALL_DIR/"
 
     chmod +x "$INSTALL_DIR/gc2607_isp"
     chmod +x "$INSTALL_DIR/gc2607-service.sh"
     chmod +x "$INSTALL_DIR/gc2607-isp-start.sh"
     chmod +x "$INSTALL_DIR/gc2607-restart-wireplumber.sh"
+    chmod +x "$INSTALL_DIR/gc2607-settings"
+    chmod +x "$INSTALL_DIR/gc2607-settings-helper.sh"
 
     # Fix SCRIPT_DIR inside service script
     sed -i "s|^SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" \
@@ -470,6 +542,9 @@ install_config() {
     log "=== Phase 6: Camera config ==="
 
     mkdir -p /etc/gc2607
+
+    mkdir -p /etc/gc2607
+    chmod 1777 /etc/gc2607
 
     if [ ! -f "$CONF_FILE" ]; then
         cat > "$CONF_FILE" <<'EOF'
@@ -492,10 +567,47 @@ saturation=100
 wb=auto
 rotation=180
 EOF
+        chmod 666 "$CONF_FILE"
         log "Created $CONF_FILE"
     else
+        chmod 666 "$CONF_FILE"   # ensure writable even if installed previously
         log "Keeping existing $CONF_FILE"
     fi
+}
+
+# ── Phase 6b: Settings app + polkit ───────────────────────────────────
+install_settings_app() {
+    log "=== Phase 6b: Installing settings app ==="
+
+    # Make config dir+file world-writable so any logged-in user can write
+    # the config directly from the GUI — no group, no pkexec, no password.
+    # The file contains only camera tuning parameters, nothing sensitive.
+    mkdir -p /etc/gc2607
+    chmod 1777 /etc/gc2607          # sticky + rwxrwxrwx (like /tmp)
+    [ -f "$CONF_FILE" ] && chmod 666 "$CONF_FILE" || true
+
+    # polkit rule: allow any active session user to run the helper
+    # (kept as a fallback in case direct write ever fails)
+    mkdir -p /etc/polkit-1/rules.d
+    cat > /etc/polkit-1/rules.d/50-gc2607.rules <<'POLKIT'
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "/opt/gc2607/gc2607-settings-helper.sh" &&
+        subject.active) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+
+    # .desktop file → visible in GNOME app drawer
+    cp "$SCRIPT_DIR/gc2607-settings.desktop" \
+        /usr/share/applications/gc2607-settings.desktop
+    chmod 644 /usr/share/applications/gc2607-settings.desktop
+
+    # Symlink binary so it's in PATH
+    ln -sf "$INSTALL_DIR/gc2607-settings" /usr/local/bin/gc2607-settings 2>/dev/null || true
+
+    log "Settings app installed — launch 'GC2607 Camera Settings' from GNOME or run: gc2607-settings"
 }
 
 # ── Phase 7: Wireplumber config ────────────────────────────────────────
@@ -511,19 +623,26 @@ install_wireplumber() {
     [ -n "$user" ] || { warn "Could not determine user, skipping wireplumber config"; return; }
 
     mkdir -p "$wpdir"
-    cat > "${wpdir}/50-hide-ipu6-raw.conf" <<'EOF'
+    # Remove old config name if it exists from a previous install
+    rm -f "${wpdir}/50-hide-ipu6-raw.conf"
+    # Force apps to use the ISP output /dev/video50:
+    # 1) hide raw PCI-backed IPU6 V4L2 devices
+    # 2) hide libcamera-provided camera nodes (they bypass our ISP settings)
+    cat > "${wpdir}/50-gc2607-routing.conf" <<'EOF'
+# Hide raw IPU6 V4L2 capture nodes (PCI devices) from PipeWire.
+# /dev/video50 (v4l2loopback) is NOT a PCI device so it stays visible.
 monitor.v4l2.rules = [
   {
-    matches = [
-      {
-        device.name = "~v4l2_device.pci-*"
-      }
-    ]
-    actions = {
-      update-props = {
-        device.disabled = true
-      }
-    }
+    matches = [ { device.name = "~v4l2_device.pci-*" } ]
+    actions = { update-props = { device.disabled = true } }
+  }
+]
+
+# Hide libcamera camera nodes so desktop apps use /dev/video50 (ISP output)
+monitor.libcamera.rules = [
+  {
+    matches = [ { device.name = "~.*" } ]
+    actions = { update-props = { device.disabled = true } }
   }
 ]
 EOF
@@ -539,9 +658,8 @@ install_service() {
     cat > /etc/systemd/system/gc2607-camera.service <<EOF
 [Unit]
 Description=GC2607 Camera Driver Setup
-After=multi-user.target
-# Re-run if kernel modules change (e.g. after kernel update)
-ConditionPathExists=/lib/modules/${KERN}/kernel/drivers/media/i2c
+After=systemd-modules-load.service
+Before=gc2607-isp.service
 
 [Service]
 Type=oneshot
@@ -560,8 +678,8 @@ EOF
     cat > /etc/systemd/system/gc2607-isp.service <<EOF
 [Unit]
 Description=GC2607 ISP Pipeline (raw sensor → /dev/video50)
-After=gc2607-camera.service
 Requires=gc2607-camera.service
+After=gc2607-camera.service
 
 [Service]
 Type=simple
@@ -575,10 +693,48 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
+    # gc2607-wp-sync.service/timer — one-shot sync of user media stack after boot.
+    # This avoids repeated restarts during active camera sessions.
+    cat > /etc/systemd/system/gc2607-wp-sync.service <<EOF
+[Unit]
+Description=GC2607 WirePlumber/PipeWire Sync
+After=gc2607-camera.service
+
+[Service]
+Type=oneshot
+ExecStart=${INSTALL_DIR}/gc2607-restart-wireplumber.sh
+StandardOutput=journal
+StandardError=journal
+EOF
+
+    cat > /etc/systemd/system/gc2607-wp-sync.timer <<'EOF'
+[Unit]
+Description=Periodic GC2607 user media stack sync
+
+[Timer]
+OnBootSec=30s
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
     systemctl daemon-reload
     systemctl enable gc2607-camera.service
     systemctl enable gc2607-isp.service
+    systemctl enable gc2607-wp-sync.timer
     log "Services installed and enabled"
+}
+
+# ── Phase 8b: Disable conflicting virtual webcam services ─────────────
+disable_conflicts() {
+    log "=== Phase 8b: Disabling conflicting webcam services ==="
+
+    if systemctl list-unit-files 2>/dev/null | grep -q "^virtual-webcam.service"; then
+        systemctl disable --now virtual-webcam.service 2>/dev/null || true
+        log "Disabled virtual-webcam.service (conflicts with /dev/video50 routing)"
+    fi
 }
 
 # ── Phase 9: Sign modules (Secure Boot) ───────────────────────────────
@@ -658,31 +814,9 @@ start_camera() {
     systemctl stop gc2607-camera.service 2>/dev/null || true
     sleep 1
 
-    # Check if the patched ipu_bridge is already loaded in memory.
-    # If so, no module reload is needed — just restart the services.
-    local ipu_loaded=0
-    local ipu_patched=0
-    if grep -q "^ipu_bridge " /proc/modules 2>/dev/null; then
-        ipu_loaded=1
-        # Check if the currently loaded module has GC2607 support
-        # (the in-memory binary contains the GCTI2607 string)
-        local ipu_mod_path
-        ipu_mod_path=$(modinfo -F filename ipu_bridge 2>/dev/null || true)
-        if [ -n "$ipu_mod_path" ]; then
-            if [[ "$ipu_mod_path" == *.xz ]]; then
-                xz -dc "$ipu_mod_path" 2>/dev/null | grep -qa "GCTI2607" && ipu_patched=1
-            else
-                grep -qa "GCTI2607" "$ipu_mod_path" 2>/dev/null && ipu_patched=1
-            fi
-        fi
-    fi
-
-    if [ "$ipu_loaded" -eq 1 ] && [ "$ipu_patched" -eq 1 ]; then
-        # Patched modules are already loaded — no need to reload anything.
-        log "Patched ipu_bridge already loaded — skipping module reload"
-    else
-        # Try to unload and reload the module stack so the patched modules take effect.
-        # If any module is busy, a single reboot is needed.
+    systemctl start gc2607-camera.service || true
+    if ! systemctl is-active --quiet gc2607-camera.service; then
+        warn "Initial camera start failed, forcing module stack reload and retrying..."
         local need_reboot=0
         for mod in gc2607 intel-ipu6-isys intel-ipu6 ipu_bridge; do
             if grep -q "^${mod} " /proc/modules 2>/dev/null; then
@@ -692,7 +826,6 @@ start_camera() {
                 fi
             fi
         done
-
         if [ "$need_reboot" -eq 1 ]; then
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -706,19 +839,77 @@ start_camera() {
             save_state
             exit 0
         fi
+        systemctl start gc2607-camera.service || \
+            die "Camera setup failed after retry. Check: journalctl -u gc2607-camera.service -n 80"
     fi
 
-    # Load v4l2loopback for /dev/video50 (ISP output)
-    modprobe v4l2loopback video_nr=50 card_label="GC2607 Camera" \
-        exclusive_caps=1 2>/dev/null || true
+    systemctl start gc2607-isp.service || true
+    wait_service_active gc2607-isp.service 25 || \
+        die "ISP service failed to become active. Check: journalctl -u gc2607-isp.service -n 80"
 
-    systemctl start gc2607-camera.service || \
-        die "Camera setup failed. Check: journalctl -u gc2607-camera.service -n 30"
-
-    systemctl start gc2607-isp.service || \
-        warn "ISP service failed to start immediately (will retry automatically)"
+    systemctl start gc2607-wp-sync.service 2>/dev/null || true
+    systemctl start gc2607-wp-sync.timer 2>/dev/null || true
 
     log "Camera ready. LED activates only when an app opens the camera."
+}
+
+# ── Phase 11b: Runtime verification ───────────────────────────────────
+verify_runtime() {
+    log "=== Phase 11b: Verifying runtime ==="
+
+    local media_ok=0
+    for dev in /dev/media*; do
+        [ -e "$dev" ] || continue
+        if media-ctl -d "$dev" --print-topology 2>/dev/null | grep -qi "gc2607"; then
+            media_ok=1
+            break
+        fi
+    done
+    [ "$media_ok" -eq 1 ] || die "GC2607 not visible in media topology after install"
+
+    local i
+    for i in $(seq 1 20); do
+        [ -e /dev/video50 ] && break
+        sleep 1
+    done
+    [ -e /dev/video50 ] || die "/dev/video50 not found (v4l2loopback routing not ready)"
+
+    local smoke="/tmp/gc2607-smoke-test.yuv"
+    local smoke_ok=0
+    local attempt
+    for attempt in 1 2 3; do
+        rm -f "$smoke"
+
+        # On some machines the first run is too early: ISP is up but not yet pushing frames.
+        # Retry with a short settle delay and restart ISP between attempts.
+        if [ "$attempt" -gt 1 ]; then
+            warn "Smoke test retry ${attempt}/3: restarting gc2607-isp.service"
+            systemctl restart gc2607-isp.service 2>/dev/null || true
+            sleep 3
+        fi
+
+        if timeout 35 v4l2-ctl -d /dev/video50 \
+            --stream-mmap=3 --stream-count=60 --stream-to="$smoke" >/dev/null 2>&1; then
+            if [ -s "$smoke" ]; then
+                smoke_ok=1
+                break
+            fi
+        fi
+        sleep 2
+    done
+
+    if [ "$smoke_ok" -ne 1 ]; then
+        rm -f "$smoke"
+        warn "Smoke test failed. Recent logs:"
+        journalctl -u gc2607-camera.service -u gc2607-isp.service -n 120 --no-pager || true
+        warn "Failed to capture non-empty frames from /dev/video50 after retries"
+        warn "A reboot is likely required to activate the patched camera stack cleanly"
+        RUNTIME_VERIFY_WARN=1
+        return 0
+    fi
+    rm -f "$smoke"
+
+    log "Runtime verification passed (/dev/video50 streams correctly)"
 }
 
 # ── Phase 11: Save state ───────────────────────────────────────────────
@@ -754,11 +945,18 @@ show_status() {
     fi
 
     echo ""
+    if [ "$RUNTIME_VERIFY_WARN" -eq 1 ]; then
+        echo -e "${YELLOW}⚠ Runtime verification incomplete.${NC}"
+        echo "  Reboot now and test the camera again:"
+        echo "  sudo reboot"
+        echo ""
+    fi
+    echo ""
     echo "  Open any camera app — it will find 'GC2607 Camera' (/dev/video50)"
     echo "  LED turns on only when an app is actively reading the camera"
     echo ""
-    echo "  Config:        $CONF_FILE"
-    echo "  Apply config:  sudo systemctl restart gc2607-isp.service"
+    echo "  Settings GUI:  gc2607-settings   (or search GNOME apps)"
+    echo "  Config file:   $CONF_FILE        (changes apply instantly)"
     echo "  All logs:      journalctl -u gc2607-camera.service -u gc2607-isp.service -f"
     echo "  DKMS:          dkms status"
     echo ""
@@ -780,11 +978,14 @@ main() {
     build_isp
     install_files
     install_config
+    install_settings_app
     install_wireplumber
     install_service
+    disable_conflicts
     sign_modules
     start_camera
     save_state
+    verify_runtime
     show_status
 }
 

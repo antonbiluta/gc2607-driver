@@ -18,13 +18,18 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <ctype.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <limits.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/inotify.h>
 #include <linux/videodev2.h>
 
 /* ── Sensor constants (fixed hardware) ─────────────────────────────── */
@@ -40,13 +45,19 @@
 #define SENSOR_FPS      30          /* Sensor always runs at 30fps */
 
 /* ── ISP tuning constants ───────────────────────────────────────────── */
-#define WB_SMOOTHING    0.85f
-#define WB_SUBSAMPLE    8
-#define AE_SMOOTHING    0.92f
-#define AE_INTERVAL_S   1.5
-#define BRIGHTNESS_MIN  0.3f
-#define BRIGHTNESS_MAX  4.0f
-#define NUM_BUFFERS     4
+#define WB_SMOOTHING        0.88f   /* steady-state smoothing */
+#define WB_SMOOTHING_FAST   0.0f    /* first N frames: instant convergence */
+#define WB_FAST_FRAMES      20      /* frames before switching to smooth */
+#define WB_SUBSAMPLE        8
+#define AE_SMOOTHING        0.90f
+#define AE_SMOOTHING_FAST   0.50f   /* fast convergence at startup / scene change */
+#define AE_FAST_FRAMES      30      /* frames of fast AE after startup/scene change */
+#define AE_INTERVAL_S       0.8     /* how often to adjust hardware controls */
+#define AE_SCENE_CHANGE_THR 0.4f    /* brightness ratio that triggers fast AE */
+#define BRIGHTNESS_MIN      0.3f
+#define BRIGHTNESS_MAX      4.0f
+#define NUM_BUFFERS         4
+#define CONFIG_PATH         "/etc/gc2607/gc2607.conf"
 
 /* ── White balance preset R/B gains (green=1.0) ─────────────────────
  * Derived from typical spectral conditions; fine-tune if needed.     */
@@ -74,7 +85,10 @@ static int   cfg_rotation  = 180;    /* 0 or 180 — sensor is mounted upside-do
 static int OUT_W, OUT_H;
 
 /* ── State ──────────────────────────────────────────────────────────── */
-static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t running      = 1;
+static volatile sig_atomic_t config_dirty = 0; /* set by inotify watcher */
+
+static void sighup_handler(int sig) { (void)sig; config_dirty = 1; }
 
 struct buffer { void *start; size_t length; };
 
@@ -406,6 +420,50 @@ static void apply_arg(const char *key, const char *val)
     }
 }
 
+/* ── Consumer detection via /proc/PID/fd ───────────────────────────── *
+ * Returns number of processes (other than self) that have dev open.   *
+ * Called infrequently (~every 2 s) so /proc overhead is acceptable.  */
+static int count_readers(const char *dev)
+{
+    struct stat target;
+    if (stat(dev, &target) < 0) return 0;
+
+    DIR *proc = opendir("/proc");
+    if (!proc) return 0;
+
+    pid_t my_pid = getpid();
+    int found = 0;
+    struct dirent *pe;
+
+    while ((pe = readdir(proc)) != NULL && !found) {
+        if (!isdigit((unsigned char)pe->d_name[0])) continue;
+        pid_t pid = (pid_t)atoi(pe->d_name);
+        if (pid == my_pid) continue;
+
+        char fddir[64];
+        snprintf(fddir, sizeof(fddir), "/proc/%d/fd", pid);
+        DIR *fds = opendir(fddir);
+        if (!fds) continue;
+
+        struct dirent *fe;
+        while ((fe = readdir(fds)) != NULL && !found) {
+            if (fe->d_name[0] == '.') continue;
+            char link[PATH_MAX];
+            int n = snprintf(link, sizeof(link), "/proc/%d/fd/%s", pid, fe->d_name);
+            if (n < 0 || n >= (int)sizeof(link))
+                continue;
+            struct stat lst;
+            if (stat(link, &lst) == 0 &&
+                lst.st_dev == target.st_dev &&
+                lst.st_ino == target.st_ino)
+                found++;
+        }
+        closedir(fds);
+    }
+    closedir(proc);
+    return found;
+}
+
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
@@ -504,6 +562,7 @@ int main(int argc, char *argv[])
 
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGHUP,  sighup_handler); /* kill -HUP → reload config */
 
     /* Sensor subdev for hardware AE */
     char subdev_path[64] = {0};
@@ -514,69 +573,117 @@ int main(int argc, char *argv[])
         printf("[gc2607_isp] Warning: no sensor subdev (no hardware AE)\n");
 
     int cur_exposure = EXPOSURE_MAX, cur_gain = GAIN_MAX;
-    if (has_subdev)
-        set_sensor_controls(subdev_path, cur_exposure, cur_gain);
 
-    struct buffer bufs[NUM_BUFFERS];
-    int n_bufs = 0;
-    int cap_fd = open_capture(capture_dev, bufs, &n_bufs);
-    if (cap_fd < 0) return 1;
+    /* inotify: watch the config *directory* so we catch atomic renames
+     * (editors and install(1) write a temp file then rename it over the
+     * original, which replaces the inode — a watch on the file itself
+     * would miss that event entirely).                                  */
+    int inotify_fd = inotify_init1(IN_NONBLOCK);
+    if (inotify_fd >= 0)
+        inotify_add_watch(inotify_fd, "/etc/gc2607",
+                          IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
 
+    /* Output device — open once, keep open; we write frames when streaming */
     int out_fd = open_output(output_dev);
-    if (out_fd < 0) { close(cap_fd); return 1; }
+    if (out_fd < 0) return 1;
 
-    printf("[gc2607_isp] Streaming %dx%d @ %dfps\n", OUT_W, OUT_H, cfg_fps);
-    printf("[gc2607_isp] Sensor pauses automatically when no app uses the camera\n");
+    printf("[gc2607_isp] Ready. Sensor starts only when an app opens the camera.\n");
+    printf("[gc2607_isp] Config hot-reload: edit %s (changes apply immediately)\n",
+           CONFIG_PATH);
 
     /* ISP state */
-    float brightness   = 1.0f;
-    int   frame_count  = 0;
-    int   output_count = 0;
+    float brightness    = 1.0f;
+    float prev_bright8  = -1.0f;
+    int   frame_count   = 0;
+    int   output_count  = 0;
+    int   ae_fast_left  = AE_FAST_FRAMES;
+    int   wb_fast_left  = WB_FAST_FRAMES;
 
-    /* Consumer-detection state machine:
-     *   streaming=1 — sensor running, processing frames
-     *   streaming=0 — STREAMOFF issued, waiting for a consumer on output_dev
-     * After IDLE_THRESHOLD consecutive EAGAIN writes we STREAMOFF (LED off).
-     * We probe /dev/videoN by writing a gray frame; first success restarts. */
-#define IDLE_THRESHOLD  90   /* ~3 s at 30 fps */
-    int streaming     = 1;
-    int eagain_streak = 0;
+    /* Capture resources — allocated on-demand */
+    struct buffer bufs[NUM_BUFFERS];
+    int  n_bufs   = 0;
+    int  cap_fd   = -1;
+    int  streaming = 0;   /* 1 = sensor open + STREAMON */
+
+#define READER_CHECK_INTERVAL_S  1   /* how often to poll /proc for readers */
+/* Stop only after several consecutive "no readers" checks to avoid
+ * rapid on/off oscillation when apps switch camera sessions. */
+#define NO_READER_STOP_CHECKS    2
+    struct timespec last_reader_check = {0};
+    struct timespec last_ae_time      = {0};
+    struct timespec last_idle_push     = {0};
+    clock_gettime(CLOCK_MONOTONIC, &last_reader_check);
+    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
+    clock_gettime(CLOCK_MONOTONIC, &last_idle_push);
+    int no_reader_checks = 0;
 
     size_t frame_bytes = (size_t)(OUT_W * OUT_H * 2);
 
-    struct timespec last_ae_time;
-    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
-
     while (running) {
 
-        /* ── Idle: sensor off, poll for consumer ─────────────────────── */
-        if (!streaming) {
-            /* Write a gray frame to probe whether a consumer is reading */
-            memset(flip_buf, 0x80, frame_bytes); /* 0x80 = neutral gray YUYV */
-            ssize_t probe = write(out_fd, flip_buf, frame_bytes);
-            if (probe > 0) {
-                /* Consumer appeared — re-queue all buffers and restart */
-                for (int ri = 0; ri < n_bufs; ri++) {
-                    struct v4l2_buffer qb = {0};
-                    qb.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                    qb.memory = V4L2_MEMORY_MMAP;
-                    qb.index  = ri;
-                    xioctl(cap_fd, VIDIOC_QBUF, &qb);
-                }
-                enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                if (xioctl(cap_fd, VIDIOC_STREAMON, &st) == 0) {
-                    streaming     = 1;
-                    eagain_streak = 0;
+        /* ── Reader check: start/stop sensor based on /dev/video50 usage ── */
+        struct timespec now_rc;
+        clock_gettime(CLOCK_MONOTONIC, &now_rc);
+        double since_check = (now_rc.tv_sec  - last_reader_check.tv_sec) +
+                             (now_rc.tv_nsec - last_reader_check.tv_nsec) / 1e9;
+
+        if (since_check >= READER_CHECK_INTERVAL_S) {
+            last_reader_check = now_rc;
+            int readers = count_readers(output_dev);
+
+            if (!streaming && readers > 0) {
+                /* Someone opened /dev/video50 — start sensor */
+                printf("[gc2607_isp] Consumer appeared — starting sensor (LED on)\n");
+                cap_fd = open_capture(capture_dev, bufs, &n_bufs);
+                if (cap_fd >= 0) {
+                    streaming    = 1;
+                    ae_fast_left = AE_FAST_FRAMES;
+                    wb_fast_left = WB_FAST_FRAMES;
+                    no_reader_checks = 0;
                     if (has_subdev)
                         set_sensor_controls(subdev_path, cur_exposure, cur_gain);
-                    printf("[gc2607_isp] Consumer detected — sensor started (LED on)\n");
+                    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
                 } else {
-                    perror("[gc2607_isp] VIDIOC_STREAMON");
-                    usleep(5000000);
+                    printf("[gc2607_isp] Failed to open capture device\n");
                 }
-            } else {
-                usleep(2000000); /* 2 s between probes */
+            } else if (streaming) {
+                if (readers == 0) {
+                    no_reader_checks++;
+                    if (no_reader_checks >= NO_READER_STOP_CHECKS) {
+                        /* Nobody reading for several checks — stop sensor */
+                        printf("[gc2607_isp] No consumers — stopping sensor (LED off)\n");
+                        enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                        xioctl(cap_fd, VIDIOC_STREAMOFF, &st);
+                        for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
+                        close(cap_fd);
+                        cap_fd    = -1;
+                        n_bufs    = 0;
+                        streaming = 0;
+                        frame_count = output_count = 0;
+                        no_reader_checks = 0;
+                    }
+                } else {
+                    no_reader_checks = 0;
+                }
             }
+        }
+
+        /* ── Idle: nobody watching, just sleep ───────────────────────── */
+        if (!streaming) {
+            struct timespec now_ip;
+            clock_gettime(CLOCK_MONOTONIC, &now_ip);
+            double idle_elapsed = (now_ip.tv_sec  - last_idle_push.tv_sec) +
+                                  (now_ip.tv_nsec - last_idle_push.tv_nsec) / 1e9;
+            if (idle_elapsed >= 1.0) {
+                /* Keep v4l2loopback source visible in PipeWire/Chrome even
+                 * when sensor is idle: push a neutral frame without waking sensor. */
+                memset(flip_buf, 0x80, frame_bytes);
+                ssize_t wr = write(out_fd, flip_buf, frame_bytes);
+                if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                    perror("[gc2607_isp] idle keepalive write");
+                last_idle_push = now_ip;
+            }
+            usleep(500000);
             continue;
         }
 
@@ -597,65 +704,125 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        const uint16_t *bayer = (const uint16_t *)bufs[buf.index].start;
+        /* ── Config hot-reload (inotify + SIGHUP) ───────────────────── */
+        if (config_dirty) {
+            config_dirty = 0;
+            load_config(CONFIG_PATH);
+            OUT_W = cfg_half_res ? SENSOR_W/2 : SENSOR_W;
+            OUT_H = cfg_half_res ? SENSOR_H/2 : SENSOR_H;
+            /* re-parse WB mode */
+            if (!strcmp(cfg_wb_mode, "auto")) {
+                wb_auto = 1;
+            } else if (!strcmp(cfg_wb_mode, "manual")) {
+                wb_auto = 0; wb_r = cfg_wb_red; wb_b = cfg_wb_blue;
+            } else {
+                wb_auto = 0;
+                for (int pi = 0; WB_PRESETS[pi].name; pi++) {
+                    if (!strcmp(cfg_wb_mode, WB_PRESETS[pi].name)) {
+                        wb_r = WB_PRESETS[pi].r; wb_b = WB_PRESETS[pi].b; break;
+                    }
+                }
+            }
+            /* trigger fast convergence after settings change */
+            ae_fast_left = AE_FAST_FRAMES;
+            wb_fast_left = WB_FAST_FRAMES;
+            printf("[gc2607_isp] Config reloaded: res=%dx%d fps=%d bright=%.0f wb=%s\n",
+                   OUT_W, OUT_H, cfg_fps, (double)cfg_brightness, cfg_wb_mode);
+        }
+        /* drain inotify events — set config_dirty if gc2607.conf changed */
+        if (inotify_fd >= 0) {
+            char ibuf[sizeof(struct inotify_event) + NAME_MAX + 1];
+            ssize_t nb;
+            while ((nb = read(inotify_fd, ibuf, sizeof(ibuf))) > 0) {
+                /* walk possibly-multiple events in the buffer */
+                for (char *p = ibuf; p < ibuf + nb; ) {
+                    struct inotify_event *ev = (struct inotify_event *)p;
+                    if (ev->len > 0 &&
+                        strncmp(ev->name, "gc2607.conf", ev->len) == 0)
+                        config_dirty = 1;
+                    p += sizeof(struct inotify_event) + ev->len;
+                }
+            }
+        }
 
-        /* WB gains for this frame */
-        float fr = wb_r;
-        float fb = wb_b;
+        const uint16_t *bayer = (const uint16_t *)bufs[buf.index].start;
 
         /* Process frame */
         float r_mean, g_mean, b_mean;
         int   stat_count;
-        build_luts(fr, 1.0f, fb, brightness);
+        build_luts(wb_r, 1.0f, wb_b, brightness);
 
         if (cfg_half_res)
             demosaic_half(bayer, &r_mean, &g_mean, &b_mean, &stat_count);
         else
             demosaic_full(bayer, &r_mean, &g_mean, &b_mean, &stat_count);
 
-        /* Gray-world AWB update */
+        /* ── Gray-world AWB ──────────────────────────────────────────── */
         if (wb_auto && r_mean > 1.0f && g_mean > 1.0f && b_mean > 1.0f) {
             float nr = g_mean / r_mean;
             float nb = g_mean / b_mean;
-            if (nr > 4.0f)  nr = 4.0f;  if (nr < 0.25f) nr = 0.25f;
-            if (nb > 4.0f)  nb = 4.0f;  if (nb < 0.25f) nb = 0.25f;
-            float sm = output_count < 10 ? 0.0f : WB_SMOOTHING;
+            if (nr > 4.0f) nr = 4.0f; else if (nr < 0.25f) nr = 0.25f;
+            if (nb > 4.0f) nb = 4.0f; else if (nb < 0.25f) nb = 0.25f;
+            float sm = (wb_fast_left > 0) ? WB_SMOOTHING_FAST : WB_SMOOTHING;
             wb_r = sm * wb_r + (1.0f - sm) * nr;
             wb_b = sm * wb_b + (1.0f - sm) * nb;
+            if (wb_fast_left > 0) wb_fast_left--;
         }
 
-        /* Software AE */
+        /* ── Software AE ─────────────────────────────────────────────── */
         float cur_bright8 = g_mean * brightness / MAX_SIGNAL * 255.0f;
+
+        /* Scene change detection: sudden brightness shift → fast AE */
+        if (prev_bright8 > 1.0f && cur_bright8 > 1.0f) {
+            float ratio = cur_bright8 / prev_bright8;
+            if (ratio > (1.0f + AE_SCENE_CHANGE_THR) ||
+                ratio < (1.0f - AE_SCENE_CHANGE_THR)) {
+                ae_fast_left = AE_FAST_FRAMES;
+            }
+        }
+        prev_bright8 = cur_bright8;
+
         if (cur_bright8 > 1.0f) {
+            float ae_sm = (ae_fast_left > 0) ? AE_SMOOTHING_FAST : AE_SMOOTHING;
             float ratio = cfg_brightness / cur_bright8;
-            brightness = AE_SMOOTHING * brightness + (1.0f - AE_SMOOTHING) * (brightness * ratio);
+            brightness = ae_sm * brightness + (1.0f - ae_sm) * (brightness * ratio);
             if (brightness < BRIGHTNESS_MIN) brightness = BRIGHTNESS_MIN;
             if (brightness > BRIGHTNESS_MAX) brightness = BRIGHTNESS_MAX;
+            if (ae_fast_left > 0) ae_fast_left--;
         }
 
-        /* Hardware AE */
+        /* ── Hardware AE (exposure + gain) ──────────────────────────── */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = (now.tv_sec - last_ae_time.tv_sec) +
                          (now.tv_nsec - last_ae_time.tv_nsec) / 1e9;
-        if (has_subdev && elapsed >= AE_INTERVAL_S) {
-            if (brightness > 2.5f) {
+        double ae_interval = (ae_fast_left > 0) ? (AE_INTERVAL_S / 3.0) : AE_INTERVAL_S;
+        if (has_subdev && elapsed >= ae_interval) {
+            int changed = 0;
+            if (brightness > 2.0f) {
+                /* Too dark — raise exposure first, then gain */
                 if (cur_exposure < EXPOSURE_MAX) {
-                    cur_exposure = (int)(cur_exposure * 1.5);
+                    cur_exposure = (int)(cur_exposure * (ae_fast_left > 0 ? 2.0 : 1.4));
                     if (cur_exposure > EXPOSURE_MAX) cur_exposure = EXPOSURE_MAX;
                 } else if (cur_gain < GAIN_MAX) {
-                    cur_gain += 2;
+                    cur_gain += (ae_fast_left > 0 ? 3 : 1);
                     if (cur_gain > GAIN_MAX) cur_gain = GAIN_MAX;
                 }
-                set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+                changed = 1;
                 brightness = 1.0f;
-            } else if (brightness < 0.8f && (cur_exposure > EXPOSURE_MIN || cur_gain > GAIN_MIN)) {
-                cur_exposure = (int)(cur_exposure * 0.7);
-                if (cur_exposure < EXPOSURE_MIN) cur_exposure = EXPOSURE_MIN;
-                if (cur_exposure == EXPOSURE_MIN && cur_gain > GAIN_MIN) cur_gain--;
-                set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+            } else if (brightness < 0.6f && (cur_exposure > EXPOSURE_MIN || cur_gain > GAIN_MIN)) {
+                /* Too bright — lower gain first, then exposure */
+                if (cur_gain > GAIN_MIN) {
+                    cur_gain -= (ae_fast_left > 0 ? 3 : 1);
+                    if (cur_gain < GAIN_MIN) cur_gain = GAIN_MIN;
+                } else {
+                    cur_exposure = (int)(cur_exposure * (ae_fast_left > 0 ? 0.4 : 0.75));
+                    if (cur_exposure < EXPOSURE_MIN) cur_exposure = EXPOSURE_MIN;
+                }
+                changed = 1;
                 brightness = 1.0f;
             }
+            if (changed) set_sensor_controls(subdev_path, cur_exposure, cur_gain);
             last_ae_time = now;
         }
 
@@ -670,22 +837,7 @@ int main(int argc, char *argv[])
         /* Return buffer to capture queue */
         if (xioctl(cap_fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF"); break; }
 
-        /* Track consecutive EAGAIN to detect "no consumers" */
-        if (wr < 0) {
-            if (errno == EAGAIN) {
-                if (++eagain_streak >= IDLE_THRESHOLD) {
-                    printf("[gc2607_isp] No consumers — pausing sensor (LED off)\n");
-                    enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                    xioctl(cap_fd, VIDIOC_STREAMOFF, &st);
-                    streaming     = 0;
-                    eagain_streak = 0;
-                }
-            } else {
-                perror("write output"); break;
-            }
-        } else {
-            eagain_streak = 0;
-        }
+        if (wr < 0 && errno != EAGAIN) { perror("write output"); break; }
 
         output_count++;
         if (output_count % 150 == 0) {
@@ -698,12 +850,13 @@ int main(int argc, char *argv[])
     printf("[gc2607_isp] Shutdown (%d sensor frames, %d output frames)\n",
            frame_count, output_count);
 
-    if (streaming) {
+    if (streaming && cap_fd >= 0) {
         enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         xioctl(cap_fd, VIDIOC_STREAMOFF, &t);
+        for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
+        close(cap_fd);
     }
-    for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
-    close(cap_fd);
     close(out_fd);
+    if (inotify_fd >= 0) close(inotify_fd);
     return 0;
 }

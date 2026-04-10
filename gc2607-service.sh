@@ -29,11 +29,12 @@ log "Loading kernel modules..."
 modprobe videodev    2>/dev/null || true
 modprobe v4l2-async  2>/dev/null || true
 
-# Load v4l2loopback for /dev/video50 — the ISP output device that apps open
-modprobe v4l2loopback video_nr=50 card_label="GC2607 Camera" \
-    exclusive_caps=1 2>/dev/null || \
+# Load v4l2loopback — parameters come from /etc/modprobe.d/gc2607-v4l2loopback.conf
+# so /dev/video50 is created automatically with the right card_label.
+if ! grep -q "^v4l2loopback " /proc/modules 2>/dev/null; then
     modprobe v4l2loopback 2>/dev/null || \
-    log "WARNING: v4l2loopback not available — ISP output (/dev/video50) will fail"
+        log "WARNING: v4l2loopback failed to load — ISP output (/dev/video50) will fail"
+fi
 
 # Reload ipu_bridge stack if loaded without GC2607 support
 if grep -q "^ipu_bridge " /proc/modules && ! ipu_bridge_has_gc2607; then

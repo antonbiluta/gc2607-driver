@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+gc2607-settings — GTK3 settings UI for GC2607 camera.
+
+Reads/writes /etc/gc2607/gc2607.conf.
+The ISP process picks up changes instantly via inotify (no restart needed).
+
+Requires:  python3-gobject (pre-installed on Fedora with GNOME)
+           polkit rule in /etc/polkit-1/rules.d/50-gc2607.rules
+           (installed by install.sh) so writing the config doesn't need a password.
+"""
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk
+
+import os, subprocess, re, threading, time
+
+CONFIG_PATH   = "/etc/gc2607/gc2607.conf"
+SERVICE_ISP   = "gc2607-isp.service"
+SERVICE_CAM   = "gc2607-camera.service"
+HELPER_SCRIPT = "/opt/gc2607/gc2607-settings-helper.sh"
+
+WB_OPTIONS = ["auto", "daylight", "cloudy", "shade", "tungsten", "fluorescent", "manual"]
+
+# ── Config I/O ─────────────────────────────────────────────────────────
+
+def read_config():
+    cfg = {
+        "resolution": "1920x1080",
+        "fps": "30",
+        "brightness": "100",
+        "saturation": "100",
+        "wb": "auto",
+        "wb_red": "1.8",
+        "wb_blue": "1.6",
+        "rotation": "180",
+    }
+    try:
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"^(\w+)\s*=\s*([^#\n]+)", line)
+                if m:
+                    cfg[m.group(1).strip()] = m.group(2).strip()
+    except OSError:
+        pass
+    return cfg
+
+def write_config(cfg):
+    lines = [
+        "# GC2607 camera settings — edited via gc2607-settings GUI",
+        "# Changes apply immediately (no restart needed)\n",
+        f"resolution={cfg['resolution']}",
+        f"fps={cfg['fps']}",
+        f"brightness={cfg['brightness']}",
+        f"saturation={cfg['saturation']}",
+        f"wb={cfg['wb']}",
+        f"wb_red={cfg['wb_red']}",
+        f"wb_blue={cfg['wb_blue']}",
+        f"rotation={cfg['rotation']}",
+    ]
+    content = "\n".join(lines) + "\n"
+
+    # Try direct write (if config is group/world writable)
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            f.write(content)
+        return True, None
+    except PermissionError:
+        pass
+
+    # Fallback: write via pkexec helper
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        result = subprocess.run(
+            ["pkexec", HELPER_SCRIPT, "write-config", tmp_path],
+            capture_output=True, text=True, timeout=30
+        )
+        os.unlink(tmp_path)
+        if result.returncode == 0:
+            return True, None
+        return False, result.stderr.strip()
+    except Exception as e:
+        return False, str(e)
+
+def service_status(name):
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True, text=True
+        )
+        return r.stdout.strip()
+    except Exception:
+        return "unknown"
+
+# ── Main window ────────────────────────────────────────────────────────
+
+class SettingsWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="GC2607 Camera Settings")
+        self.set_default_size(480, 560)
+        self.set_border_width(0)
+        self.set_resizable(False)
+
+        # Load CSS
+        css = b"""
+        .header { background-color: #1e1e2e; padding: 16px 20px; }
+        .header-title { color: white; font-size: 16px; font-weight: bold; }
+        .header-sub { color: #888; font-size: 11px; }
+        .section-label { font-weight: bold; font-size: 12px;
+                         color: #555; margin-top: 8px; margin-bottom: 2px; }
+        .status-ok  { color: #2e7d32; font-size: 12px; }
+        .status-err { color: #c62828; font-size: 12px; }
+        .status-warn{ color: #e65100; font-size: 12px; }
+        .apply-btn  { padding: 8px 24px; }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self._cfg = read_config()
+        self._build_ui()
+        self._load_from_cfg(self._cfg)
+        self._update_status()
+
+        # Refresh status every 3 s
+        GLib.timeout_add_seconds(3, self._update_status)
+
+    # ── UI builder ─────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+
+        # ─ Header ─
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        header.get_style_context().add_class("header")
+        title = Gtk.Label(label="GC2607 Camera Settings")
+        title.set_xalign(0)
+        title.get_style_context().add_class("header-title")
+        sub = Gtk.Label(label="Changes apply instantly — no restart needed")
+        sub.set_xalign(0)
+        sub.get_style_context().add_class("header-sub")
+        header.pack_start(title, False, False, 0)
+        header.pack_start(sub,   False, False, 0)
+        outer.pack_start(header, False, False, 0)
+
+        # ─ Status bar ─
+        self._status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        self._status_box.set_margin_start(20)
+        self._status_box.set_margin_end(20)
+        self._status_box.set_margin_top(10)
+        self._lbl_cam = Gtk.Label()
+        self._lbl_isp = Gtk.Label()
+        self._status_box.pack_start(self._lbl_cam, False, False, 0)
+        self._status_box.pack_start(self._lbl_isp, False, False, 0)
+        outer.pack_start(self._status_box, False, False, 0)
+
+        # ─ Settings grid ─
+        grid = Gtk.Grid()
+        grid.set_column_spacing(12)
+        grid.set_row_spacing(8)
+        grid.set_margin_start(20)
+        grid.set_margin_end(20)
+        grid.set_margin_top(12)
+        grid.set_margin_bottom(12)
+        outer.pack_start(grid, True, True, 0)
+
+        row = 0
+
+        # Image quality section
+        row = self._section(grid, row, "IMAGE QUALITY")
+
+        row = self._slider_row(grid, row, "Brightness",
+            min_=10, max_=254, step=1, attr="_sl_brightness",
+            tooltip="Auto-exposure target brightness (10–254). "
+                    "Higher = brighter image.")
+
+        row = self._slider_row(grid, row, "Saturation",
+            min_=0, max_=200, step=1, attr="_sl_saturation",
+            tooltip="Color saturation. 100 = neutral, 0 = grayscale, 200 = vivid.")
+
+        # White balance section
+        row = self._section(grid, row, "WHITE BALANCE")
+
+        lbl = Gtk.Label(label="Mode")
+        lbl.set_xalign(0)
+        grid.attach(lbl, 0, row, 1, 1)
+
+        self._cb_wb = Gtk.ComboBoxText()
+        for opt in WB_OPTIONS:
+            self._cb_wb.append_text(opt)
+        self._cb_wb.connect("changed", self._on_wb_changed)
+        grid.attach(self._cb_wb, 1, row, 2, 1)
+        row += 1
+
+        # Manual WB sub-controls (hidden unless mode=manual)
+        self._wb_manual_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        row = self._slider_row(grid, row, "  Red gain",
+            min_=50, max_=400, step=1, attr="_sl_wb_red",
+            tooltip="Manual WB red channel gain (÷100). 180 = ×1.80",
+            scale=100)
+        row = self._slider_row(grid, row, "  Blue gain",
+            min_=50, max_=400, step=1, attr="_sl_wb_blue",
+            tooltip="Manual WB blue channel gain (÷100). 160 = ×1.60",
+            scale=100)
+
+        # Capture section
+        row = self._section(grid, row, "CAPTURE")
+
+        row = self._slider_row(grid, row, "Frame rate",
+            min_=1, max_=30, step=1, attr="_sl_fps",
+            tooltip="Output FPS. Lower values reduce CPU usage.")
+
+        lbl_res = Gtk.Label(label="Resolution")
+        lbl_res.set_xalign(0)
+        grid.attach(lbl_res, 0, row, 1, 1)
+        res_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._rb_1080 = Gtk.RadioButton.new_with_label(None, "1920×1080")
+        self._rb_540  = Gtk.RadioButton.new_with_label_from_widget(
+            self._rb_1080, "960×540 (less CPU)")
+        res_box.pack_start(self._rb_1080, False, False, 0)
+        res_box.pack_start(self._rb_540,  False, False, 0)
+        grid.attach(res_box, 1, row, 2, 1)
+        row += 1
+
+        lbl_rot = Gtk.Label(label="Rotation")
+        lbl_rot.set_xalign(0)
+        grid.attach(lbl_rot, 0, row, 1, 1)
+        rot_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._rb_rot0   = Gtk.RadioButton.new_with_label(None, "0°")
+        self._rb_rot180 = Gtk.RadioButton.new_with_label_from_widget(
+            self._rb_rot0, "180° (upside-down sensor)")
+        rot_box.pack_start(self._rb_rot0,   False, False, 0)
+        rot_box.pack_start(self._rb_rot180, False, False, 0)
+        grid.attach(rot_box, 1, row, 2, 1)
+        row += 1
+
+        # ─ Buttons ─
+        sep = Gtk.Separator()
+        outer.pack_start(sep, False, False, 0)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_margin_start(20)
+        btn_box.set_margin_end(20)
+        btn_box.set_margin_top(10)
+        btn_box.set_margin_bottom(14)
+
+        self._lbl_result = Gtk.Label(label="")
+        self._lbl_result.set_xalign(0)
+        btn_box.pack_start(self._lbl_result, True, True, 0)
+
+        btn_reset = Gtk.Button(label="Reset defaults")
+        btn_reset.connect("clicked", self._on_reset)
+        btn_box.pack_start(btn_reset, False, False, 0)
+
+        btn_apply = Gtk.Button(label="Apply")
+        btn_apply.get_style_context().add_class("suggested-action")
+        btn_apply.get_style_context().add_class("apply-btn")
+        btn_apply.connect("clicked", self._on_apply)
+        btn_box.pack_start(btn_apply, False, False, 0)
+
+        outer.pack_start(btn_box, False, False, 0)
+
+    def _section(self, grid, row, text):
+        lbl = Gtk.Label(label=text)
+        lbl.set_xalign(0)
+        lbl.get_style_context().add_class("section-label")
+        if row > 0:
+            lbl.set_margin_top(6)
+        grid.attach(lbl, 0, row, 3, 1)
+        return row + 1
+
+    def _slider_row(self, grid, row, label, min_, max_, step, attr,
+                    tooltip="", scale=1):
+        """scale: internal slider value = real_value * scale"""
+        lbl = Gtk.Label(label=label)
+        lbl.set_xalign(0)
+        grid.attach(lbl, 0, row, 1, 1)
+
+        adj = Gtk.Adjustment(value=min_*scale, lower=min_*scale,
+                             upper=max_*scale, step_increment=step,
+                             page_increment=step*10)
+        sl = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
+        sl.set_hexpand(True)
+        sl.set_draw_value(True)
+        sl.set_digits(0)
+        if scale != 1:
+            sl.connect("format-value",
+                       lambda s, v: f"{v/scale:.2f}")
+        if tooltip:
+            sl.set_tooltip_text(tooltip)
+        setattr(self, attr, sl)
+        grid.attach(sl, 1, row, 2, 1)
+        return row + 1
+
+    # ── Data binding ───────────────────────────────────────────────────
+
+    def _load_from_cfg(self, cfg):
+        self._sl_brightness.set_value(float(cfg.get("brightness", 100)))
+        self._sl_saturation.set_value(float(cfg.get("saturation", 100)))
+        self._sl_fps.set_value(float(cfg.get("fps", 30)))
+
+        wb = cfg.get("wb", "auto")
+        if wb in WB_OPTIONS:
+            self._cb_wb.set_active(WB_OPTIONS.index(wb))
+        else:
+            self._cb_wb.set_active(0)
+
+        # wb_red / wb_blue stored as float, slider ×100
+        self._sl_wb_red.set_value(float(cfg.get("wb_red", 1.8)) * 100)
+        self._sl_wb_blue.set_value(float(cfg.get("wb_blue", 1.6)) * 100)
+
+        res = cfg.get("resolution", "1920x1080")
+        if res == "960x540":
+            self._rb_540.set_active(True)
+        else:
+            self._rb_1080.set_active(True)
+
+        rot = cfg.get("rotation", "180")
+        if rot == "180":
+            self._rb_rot180.set_active(True)
+        else:
+            self._rb_rot0.set_active(True)
+
+        self._on_wb_changed(self._cb_wb)
+
+    def _collect_cfg(self):
+        cfg = {}
+        cfg["brightness"] = str(int(self._sl_brightness.get_value()))
+        cfg["saturation"] = str(int(self._sl_saturation.get_value()))
+        cfg["fps"]        = str(int(self._sl_fps.get_value()))
+        cfg["wb"]         = WB_OPTIONS[self._cb_wb.get_active()]
+        cfg["wb_red"]     = f"{self._sl_wb_red.get_value()/100:.2f}"
+        cfg["wb_blue"]    = f"{self._sl_wb_blue.get_value()/100:.2f}"
+        cfg["resolution"] = "960x540" if self._rb_540.get_active() else "1920x1080"
+        cfg["rotation"]   = "180" if self._rb_rot180.get_active() else "0"
+        return cfg
+
+    # ── Callbacks ──────────────────────────────────────────────────────
+
+    def _on_wb_changed(self, combo):
+        idx = combo.get_active()
+        is_manual = (idx >= 0 and WB_OPTIONS[idx] == "manual")
+        self._sl_wb_red.set_sensitive(is_manual)
+        self._sl_wb_blue.set_sensitive(is_manual)
+
+    def _on_apply(self, _btn):
+        cfg = self._collect_cfg()
+        ok, err = write_config(cfg)
+        if ok:
+            self._lbl_result.set_markup(
+                '<span foreground="#2e7d32">✓ Saved — applying instantly</span>')
+            GLib.timeout_add_seconds(3, lambda: self._lbl_result.set_text("") or False)
+        else:
+            self._lbl_result.set_markup(
+                f'<span foreground="#c62828">✗ {GLib.markup_escape_text(err or "write failed")}</span>')
+
+    def _on_reset(self, _btn):
+        defaults = {
+            "resolution": "1920x1080", "fps": "30",
+            "brightness": "100", "saturation": "100",
+            "wb": "auto", "wb_red": "1.80", "wb_blue": "1.60",
+            "rotation": "180",
+        }
+        self._load_from_cfg(defaults)
+
+    def _update_status(self):
+        cam = service_status(SERVICE_CAM)
+        isp = service_status(SERVICE_ISP)
+
+        def _label(svc, state):
+            if state == "active":
+                return f'<span foreground="#2e7d32">● {svc}: running</span>'
+            elif state in ("failed", "inactive"):
+                return f'<span foreground="#c62828">● {svc}: {state}</span>'
+            else:
+                return f'<span foreground="#e65100">● {svc}: {state}</span>'
+
+        self._lbl_cam.set_markup(_label("Setup", cam))
+        self._lbl_isp.set_markup(_label("ISP", isp))
+        return True  # keep timer alive
+
+
+def main():
+    win = SettingsWindow()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()
+
+if __name__ == "__main__":
+    main()

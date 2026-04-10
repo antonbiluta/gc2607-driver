@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=GC2607 Camera Settings
+Comment=Adjust GC2607 camera brightness, white balance and more
+Exec=/opt/gc2607/gc2607-settings
+Icon=camera-web
+Categories=Settings;HardwareSettings;
+Keywords=camera;webcam;gc2607;
+StartupNotify=true
