@@ -528,10 +528,14 @@ int main(int argc, char *argv[])
     if (has_subdev)
         set_sensor_controls(subdev_path, cur_exposure, cur_gain);
 
-    /* inotify: watch config file for live settings reload */
+    /* inotify: watch the config *directory* so we catch atomic renames
+     * (editors and install(1) write a temp file then rename it over the
+     * original, which replaces the inode — a watch on the file itself
+     * would miss that event entirely).                                  */
     int inotify_fd = inotify_init1(IN_NONBLOCK);
     if (inotify_fd >= 0)
-        inotify_add_watch(inotify_fd, CONFIG_PATH, IN_CLOSE_WRITE | IN_MOVED_TO);
+        inotify_add_watch(inotify_fd, "/etc/gc2607",
+                          IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
 
     struct buffer bufs[NUM_BUFFERS];
     int n_bufs = 0;
@@ -643,10 +647,20 @@ int main(int argc, char *argv[])
             printf("[gc2607_isp] Config reloaded: res=%dx%d fps=%d bright=%.0f wb=%s\n",
                    OUT_W, OUT_H, cfg_fps, (double)cfg_brightness, cfg_wb_mode);
         }
-        /* drain inotify events */
+        /* drain inotify events — set config_dirty if gc2607.conf changed */
         if (inotify_fd >= 0) {
-            char ibuf[256];
-            while (read(inotify_fd, ibuf, sizeof(ibuf)) > 0) config_dirty = 1;
+            char ibuf[sizeof(struct inotify_event) + NAME_MAX + 1];
+            ssize_t nb;
+            while ((nb = read(inotify_fd, ibuf, sizeof(ibuf))) > 0) {
+                /* walk possibly-multiple events in the buffer */
+                for (char *p = ibuf; p < ibuf + nb; ) {
+                    struct inotify_event *ev = (struct inotify_event *)p;
+                    if (ev->len > 0 &&
+                        strncmp(ev->name, "gc2607.conf", ev->len) == 0)
+                        config_dirty = 1;
+                    p += sizeof(struct inotify_event) + ev->len;
+                }
+            }
         }
 
         const uint16_t *bayer = (const uint16_t *)bufs[buf.index].start;
@@ -665,8 +679,8 @@ int main(int argc, char *argv[])
         if (wb_auto && r_mean > 1.0f && g_mean > 1.0f && b_mean > 1.0f) {
             float nr = g_mean / r_mean;
             float nb = g_mean / b_mean;
-            if (nr > 4.0f)  nr = 4.0f;  if (nr < 0.25f) nr = 0.25f;
-            if (nb > 4.0f)  nb = 4.0f;  if (nb < 0.25f) nb = 0.25f;
+            if (nr > 4.0f) nr = 4.0f; else if (nr < 0.25f) nr = 0.25f;
+            if (nb > 4.0f) nb = 4.0f; else if (nb < 0.25f) nb = 0.25f;
             float sm = (wb_fast_left > 0) ? WB_SMOOTHING_FAST : WB_SMOOTHING;
             wb_r = sm * wb_r + (1.0f - sm) * nr;
             wb_b = sm * wb_b + (1.0f - sm) * nb;

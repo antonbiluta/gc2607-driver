@@ -475,6 +475,9 @@ install_config() {
 
     mkdir -p /etc/gc2607
 
+    mkdir -p /etc/gc2607
+    chmod 1777 /etc/gc2607
+
     if [ ! -f "$CONF_FILE" ]; then
         cat > "$CONF_FILE" <<'EOF'
 # GC2607 ISP settings
@@ -496,8 +499,10 @@ saturation=100
 wb=auto
 rotation=180
 EOF
+        chmod 666 "$CONF_FILE"
         log "Created $CONF_FILE"
     else
+        chmod 666 "$CONF_FILE"   # ensure writable even if installed previously
         log "Keeping existing $CONF_FILE"
     fi
 }
@@ -506,24 +511,21 @@ EOF
 install_settings_app() {
     log "=== Phase 6b: Installing settings app ==="
 
-    # Make config file group-writable so the GUI can write without pkexec
-    # when the user is in the 'gc2607' group (added below).
-    groupadd -f gc2607 2>/dev/null || true
-    local user; user=$(real_user)
-    if [ -n "$user" ]; then
-        usermod -aG gc2607 "$user" 2>/dev/null || true
-    fi
-    chown root:gc2607 /etc/gc2607 2>/dev/null || true
-    chmod 775 /etc/gc2607 2>/dev/null || true
-    [ -f "$CONF_FILE" ] && chown root:gc2607 "$CONF_FILE" && chmod 664 "$CONF_FILE" || true
+    # Make config dir+file world-writable so any logged-in user can write
+    # the config directly from the GUI — no group, no pkexec, no password.
+    # The file contains only camera tuning parameters, nothing sensitive.
+    mkdir -p /etc/gc2607
+    chmod 1777 /etc/gc2607          # sticky + rwxrwxrwx (like /tmp)
+    [ -f "$CONF_FILE" ] && chmod 666 "$CONF_FILE" || true
 
-    # polkit rule: allow gc2607 group to run the helper without password
+    # polkit rule: allow any active session user to run the helper
+    # (kept as a fallback in case direct write ever fails)
     mkdir -p /etc/polkit-1/rules.d
     cat > /etc/polkit-1/rules.d/50-gc2607.rules <<'POLKIT'
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.policykit.exec" &&
         action.lookup("program") == "/opt/gc2607/gc2607-settings-helper.sh" &&
-        subject.isInGroup("gc2607")) {
+        subject.active) {
         return polkit.Result.YES;
     }
 });
@@ -538,9 +540,6 @@ POLKIT
     ln -sf "$INSTALL_DIR/gc2607-settings" /usr/local/bin/gc2607-settings 2>/dev/null || true
 
     log "Settings app installed — launch 'GC2607 Camera Settings' from GNOME or run: gc2607-settings"
-    if [ -n "$user" ]; then
-        warn "Group membership for '$user' takes effect on next login (or run: newgrp gc2607)"
-    fi
 }
 
 # ── Phase 7: Wireplumber config ────────────────────────────────────────
