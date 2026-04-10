@@ -67,7 +67,7 @@ if ! [ -e "$OUTPUT_DEV" ]; then
     # Remove stale instance (wrong video_nr) if present
     modprobe -r v4l2loopback 2>/dev/null || true
     sleep 0.5
-    if modprobe v4l2loopback video_nr=50 card_label="GC2607 Camera" exclusive_caps=1 2>/dev/null; then
+    if modprobe v4l2loopback video_nr=50 card_label="GC2607 Camera" exclusive_caps=0 devices=1 2>/dev/null; then
         log "v4l2loopback loaded"
     else
         # modprobe.d may have locked in different params — try without params

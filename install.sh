@@ -147,7 +147,8 @@ install_deps() {
     # Write modprobe.d config so v4l2loopback always loads with video_nr=50
     cat > /etc/modprobe.d/gc2607-v4l2loopback.conf <<'EOF'
 # GC2607 ISP output device — fixed single virtual cam at /dev/video50
-options v4l2loopback devices=1 video_nr=50 card_label="GC2607 Camera" exclusive_caps=1
+# exclusive_caps=0 keeps better compatibility with Chrome/PipeWire source detection.
+options v4l2loopback devices=1 video_nr=50 card_label="GC2607 Camera" exclusive_caps=0
 EOF
     log "modprobe.d config written for v4l2loopback"
 
@@ -692,8 +693,8 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    # gc2607-wp-sync.service/timer — keep user media stack in sync even if
-    # user logs in long after boot (common cause of "device exists, source missing").
+    # gc2607-wp-sync.service/timer — one-shot sync of user media stack after boot.
+    # This avoids repeated restarts during active camera sessions.
     cat > /etc/systemd/system/gc2607-wp-sync.service <<EOF
 [Unit]
 Description=GC2607 WirePlumber/PipeWire Sync
@@ -711,8 +712,7 @@ EOF
 Description=Periodic GC2607 user media stack sync
 
 [Timer]
-OnBootSec=45s
-OnUnitActiveSec=2min
+OnBootSec=30s
 AccuracySec=10s
 Persistent=true
 
@@ -725,6 +725,16 @@ EOF
     systemctl enable gc2607-isp.service
     systemctl enable gc2607-wp-sync.timer
     log "Services installed and enabled"
+}
+
+# ── Phase 8b: Disable conflicting virtual webcam services ─────────────
+disable_conflicts() {
+    log "=== Phase 8b: Disabling conflicting webcam services ==="
+
+    if systemctl list-unit-files 2>/dev/null | grep -q "^virtual-webcam.service"; then
+        systemctl disable --now virtual-webcam.service 2>/dev/null || true
+        log "Disabled virtual-webcam.service (conflicts with /dev/video50 routing)"
+    fi
 }
 
 # ── Phase 9: Sign modules (Secure Boot) ───────────────────────────────
@@ -837,6 +847,7 @@ start_camera() {
     wait_service_active gc2607-isp.service 25 || \
         die "ISP service failed to become active. Check: journalctl -u gc2607-isp.service -n 80"
 
+    systemctl start gc2607-wp-sync.service 2>/dev/null || true
     systemctl start gc2607-wp-sync.timer 2>/dev/null || true
 
     log "Camera ready. LED activates only when an app opens the camera."
@@ -970,6 +981,7 @@ main() {
     install_settings_app
     install_wireplumber
     install_service
+    disable_conflicts
     sign_modules
     start_camera
     save_state

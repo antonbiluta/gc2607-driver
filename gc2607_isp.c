@@ -611,8 +611,10 @@ int main(int argc, char *argv[])
 #define NO_READER_STOP_CHECKS    2
     struct timespec last_reader_check = {0};
     struct timespec last_ae_time      = {0};
+    struct timespec last_idle_push     = {0};
     clock_gettime(CLOCK_MONOTONIC, &last_reader_check);
     clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
+    clock_gettime(CLOCK_MONOTONIC, &last_idle_push);
     int no_reader_checks = 0;
 
     size_t frame_bytes = (size_t)(OUT_W * OUT_H * 2);
@@ -668,6 +670,19 @@ int main(int argc, char *argv[])
 
         /* ── Idle: nobody watching, just sleep ───────────────────────── */
         if (!streaming) {
+            struct timespec now_ip;
+            clock_gettime(CLOCK_MONOTONIC, &now_ip);
+            double idle_elapsed = (now_ip.tv_sec  - last_idle_push.tv_sec) +
+                                  (now_ip.tv_nsec - last_idle_push.tv_nsec) / 1e9;
+            if (idle_elapsed >= 1.0) {
+                /* Keep v4l2loopback source visible in PipeWire/Chrome even
+                 * when sensor is idle: push a neutral frame without waking sensor. */
+                memset(flip_buf, 0x80, frame_bytes);
+                ssize_t wr = write(out_fd, flip_buf, frame_bytes);
+                if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                    perror("[gc2607_isp] idle keepalive write");
+                last_idle_push = now_ip;
+            }
             usleep(500000);
             continue;
         }
