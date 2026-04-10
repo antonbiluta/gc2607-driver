@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <ctype.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
