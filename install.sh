@@ -20,8 +20,10 @@ set -euo pipefail
 # ── Paths ──────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERN=$(uname -r)
-KERN_BASE=$(echo "$KERN" | grep -oP '^\d+\.\d+\.\d+')
-KERN_MAJOR=$(echo "$KERN" | cut -d. -f1)
+KERN_BASE=$(echo "$KERN" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+KERN_MAJOR=$(echo "$KERN_BASE" | cut -d. -f1)
+echo "$KERN_BASE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || \
+    { echo "[gc2607] ERROR: Could not parse kernel base version from: $KERN" >&2; exit 1; }
 
 INSTALL_DIR="/opt/gc2607"
 STATE_DIR="/var/lib/gc2607-driver"
@@ -46,6 +48,19 @@ log()  { echo -e "${GREEN}[gc2607]${NC} $*"; }
 warn() { echo -e "${YELLOW}[gc2607]${NC} $*"; }
 die()  { echo -e "${RED}[gc2607] ERROR:${NC} $*" >&2; exit 1; }
 
+wait_service_active() {
+    local svc="$1"
+    local timeout="${2:-25}"
+    local i
+    for i in $(seq 1 "$timeout"); do
+        if systemctl is-active --quiet "$svc"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 require_root() {
     [ "$(id -u)" -eq 0 ] || die "Run with sudo: sudo $0"
 }
@@ -66,14 +81,32 @@ install_deps() {
         log "Detected Fedora/RHEL (dnf)"
 
         # Basic build tools + kernel-devel for current kernel
-        dnf install -y \
+        if ! dnf install -y \
             gcc make \
             "kernel-devel-${KERN}" \
             elfutils-libelf-devel \
             dkms \
             wget \
+            tar \
+            xz \
+            python3 \
             v4l-utils \
-            2>/dev/null || true
+            openssl \
+            mokutil; then
+            warn "kernel-devel-${KERN} unavailable, retrying with generic kernel-devel"
+            dnf install -y \
+                gcc make \
+                kernel-devel \
+                elfutils-libelf-devel \
+                dkms \
+                wget \
+                tar \
+                xz \
+                python3 \
+                v4l-utils \
+                openssl \
+                mokutil || die "Failed to install required dependencies"
+        fi
 
         # v4l2loopback: try RPM Fusion, fallback to DKMS build
         if ! modinfo v4l2loopback &>/dev/null; then
@@ -104,6 +137,11 @@ install_deps() {
     # kernel-devel sanity check
     [ -d "/lib/modules/${KERN}/build" ] || \
         die "kernel-devel not found for ${KERN}. Install: sudo dnf install kernel-devel-${KERN}"
+
+    # Tooling sanity check
+    for cmd in dkms gcc make modprobe modinfo media-ctl v4l2-ctl xz python3; do
+        command -v "$cmd" >/dev/null 2>&1 || die "Missing required tool: $cmd"
+    done
 
     # Write modprobe.d config so v4l2loopback always loads with video_nr=50
     cat > /etc/modprobe.d/gc2607-v4l2loopback.conf <<'EOF'
@@ -201,27 +239,36 @@ setup_ipu_bridge() {
     log "=== Phase 3: Patching ipu_bridge for GC2607 ==="
 
     mkdir -p "$WORK_DIR"
-
-    # Download kernel source tarball (only once; reuse if valid)
-    if [ -f "$TARBALL" ]; then
-        log "Checking cached tarball..."
-        xz --test "$TARBALL" &>/dev/null || { warn "Corrupt tarball, re-downloading"; rm -f "$TARBALL"; }
-    fi
-
-    if [ ! -f "$TARBALL" ]; then
-        local url="https://cdn.kernel.org/pub/linux/kernel/v${KERN_MAJOR}.x/linux-${KERN_BASE}.tar.xz"
-        log "Downloading kernel source: $url"
-        wget --progress=bar:force -O "$TARBALL" "$url" || die "Download failed: $url"
-        xz --test "$TARBALL" &>/dev/null || die "Downloaded tarball is corrupt"
-    fi
-
-    # Extract intel IPU driver directory using Python for reliable path detection
-    log "Locating ipu-bridge source in tarball..."
     local ipu_src="$WORK_DIR/ipu_intel"
     rm -rf "$ipu_src"
     mkdir -p "$ipu_src"
 
-    python3 - "$TARBALL" "$ipu_src" <<'PYEOF'
+    # Prefer local kernel-devel tree (works offline and matches Fedora kernel build)
+    local local_intel_src="/usr/src/kernels/${KERN}/drivers/media/pci/intel"
+    if [ -f "${local_intel_src}/ipu-bridge.c" ]; then
+        log "Using local kernel source: ${local_intel_src}"
+        cp "${local_intel_src}"/*.c "$ipu_src/" 2>/dev/null || true
+        cp "${local_intel_src}"/*.h "$ipu_src/" 2>/dev/null || true
+    fi
+
+    # Fallback: download vanilla kernel tree if local source is unavailable
+    if [ ! -f "${ipu_src}/ipu-bridge.c" ]; then
+        # Download kernel source tarball (only once; reuse if valid)
+        if [ -f "$TARBALL" ]; then
+            log "Checking cached tarball..."
+            xz --test "$TARBALL" &>/dev/null || { warn "Corrupt tarball, re-downloading"; rm -f "$TARBALL"; }
+        fi
+
+        if [ ! -f "$TARBALL" ]; then
+            local url="https://cdn.kernel.org/pub/linux/kernel/v${KERN_MAJOR}.x/linux-${KERN_BASE}.tar.xz"
+            log "Downloading kernel source: $url"
+            wget --progress=bar:force -O "$TARBALL" "$url" || die "Download failed: $url"
+            xz --test "$TARBALL" &>/dev/null || die "Downloaded tarball is corrupt"
+        fi
+
+        # Extract intel IPU driver directory using Python for reliable path detection
+        log "Locating ipu-bridge source in tarball..."
+        python3 - "$TARBALL" "$ipu_src" <<'PYEOF'
 import sys, os, tarfile
 
 tarball, dest = sys.argv[1], sys.argv[2]
@@ -255,7 +302,8 @@ with tarfile.open(tarball, "r:xz") as tf:
 print(f"[gc2607] Extracted {count} files to {dest}")
 PYEOF
 
-    [ $? -eq 0 ] || die "Failed to extract ipu-bridge source from tarball"
+        [ $? -eq 0 ] || die "Failed to extract ipu-bridge source from tarball"
+    fi
 
     # Find ipu-bridge.c (should be directly in ipu_src now)
     local src
@@ -575,10 +623,8 @@ install_wireplumber() {
     mkdir -p "$wpdir"
     # Remove old config name if it exists from a previous install
     rm -f "${wpdir}/50-hide-ipu6-raw.conf"
-    # Hide the raw IPU6 V4L2 devices AND the libcamera representation of gc2607.
-    # This forces all apps (GNOME Camera, browsers, etc.) to use /dev/video50
-    # which is the v4l2loopback device fed by gc2607_isp (with our ISP pipeline:
-    # rotation, white balance, brightness, AE).
+    # Hide raw IPU6 V4L2 devices so apps prefer /dev/video50 (v4l2loopback).
+    # Do not globally disable libcamera devices: that can hide unrelated cameras.
     cat > "${wpdir}/50-gc2607-routing.conf" <<'EOF'
 # Hide raw IPU6 V4L2 capture nodes (PCI devices) from PipeWire.
 # /dev/video50 (v4l2loopback) is NOT a PCI device so it stays visible.
@@ -602,8 +648,6 @@ install_service() {
 [Unit]
 Description=GC2607 Camera Driver Setup
 After=multi-user.target
-# Re-run if kernel modules change (e.g. after kernel update)
-ConditionPathExists=/lib/modules/${KERN}/kernel/drivers/media/i2c
 
 [Service]
 Type=oneshot
@@ -719,31 +763,9 @@ start_camera() {
     systemctl stop gc2607-camera.service 2>/dev/null || true
     sleep 1
 
-    # Check if the patched ipu_bridge is already loaded in memory.
-    # If so, no module reload is needed — just restart the services.
-    local ipu_loaded=0
-    local ipu_patched=0
-    if grep -q "^ipu_bridge " /proc/modules 2>/dev/null; then
-        ipu_loaded=1
-        # Check if the currently loaded module has GC2607 support
-        # (the in-memory binary contains the GCTI2607 string)
-        local ipu_mod_path
-        ipu_mod_path=$(modinfo -F filename ipu_bridge 2>/dev/null || true)
-        if [ -n "$ipu_mod_path" ]; then
-            if [[ "$ipu_mod_path" == *.xz ]]; then
-                xz -dc "$ipu_mod_path" 2>/dev/null | grep -qa "GCTI2607" && ipu_patched=1
-            else
-                grep -qa "GCTI2607" "$ipu_mod_path" 2>/dev/null && ipu_patched=1
-            fi
-        fi
-    fi
-
-    if [ "$ipu_loaded" -eq 1 ] && [ "$ipu_patched" -eq 1 ]; then
-        # Patched modules are already loaded — no need to reload anything.
-        log "Patched ipu_bridge already loaded — skipping module reload"
-    else
-        # Try to unload and reload the module stack so the patched modules take effect.
-        # If any module is busy, a single reboot is needed.
+    systemctl start gc2607-camera.service || true
+    if ! systemctl is-active --quiet gc2607-camera.service; then
+        warn "Initial camera start failed, forcing module stack reload and retrying..."
         local need_reboot=0
         for mod in gc2607 intel-ipu6-isys intel-ipu6 ipu_bridge; do
             if grep -q "^${mod} " /proc/modules 2>/dev/null; then
@@ -753,7 +775,6 @@ start_camera() {
                 fi
             fi
         done
-
         if [ "$need_reboot" -eq 1 ]; then
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -767,15 +788,53 @@ start_camera() {
             save_state
             exit 0
         fi
+        systemctl start gc2607-camera.service || \
+            die "Camera setup failed after retry. Check: journalctl -u gc2607-camera.service -n 80"
     fi
 
-    systemctl start gc2607-camera.service || \
-        die "Camera setup failed. Check: journalctl -u gc2607-camera.service -n 30"
-
-    systemctl start gc2607-isp.service || \
-        warn "ISP service failed to start immediately (will retry automatically)"
+    systemctl start gc2607-isp.service || true
+    wait_service_active gc2607-isp.service 25 || \
+        die "ISP service failed to become active. Check: journalctl -u gc2607-isp.service -n 80"
 
     log "Camera ready. LED activates only when an app opens the camera."
+}
+
+# ── Phase 11b: Runtime verification ───────────────────────────────────
+verify_runtime() {
+    log "=== Phase 11b: Verifying runtime ==="
+
+    local media_ok=0
+    for dev in /dev/media*; do
+        [ -e "$dev" ] || continue
+        if media-ctl -d "$dev" --print-topology 2>/dev/null | grep -qi "gc2607"; then
+            media_ok=1
+            break
+        fi
+    done
+    [ "$media_ok" -eq 1 ] || die "GC2607 not visible in media topology after install"
+
+    local i
+    for i in $(seq 1 20); do
+        [ -e /dev/video50 ] && break
+        sleep 1
+    done
+    [ -e /dev/video50 ] || die "/dev/video50 not found (v4l2loopback routing not ready)"
+
+    local smoke="/tmp/gc2607-smoke-test.yuv"
+    if ! timeout 20 v4l2-ctl -d /dev/video50 \
+        --stream-mmap=3 --stream-count=30 --stream-to="$smoke" >/dev/null 2>&1; then
+        warn "Smoke test failed. Recent logs:"
+        journalctl -u gc2607-camera.service -u gc2607-isp.service -n 80 --no-pager || true
+        die "Failed to capture test frames from /dev/video50"
+    fi
+
+    if [ ! -s "$smoke" ]; then
+        rm -f "$smoke"
+        die "Smoke test produced empty output on /dev/video50"
+    fi
+    rm -f "$smoke"
+
+    log "Runtime verification passed (/dev/video50 streams correctly)"
 }
 
 # ── Phase 11: Save state ───────────────────────────────────────────────
@@ -843,6 +902,7 @@ main() {
     sign_modules
     start_camera
     save_state
+    verify_runtime
     show_status
 }
 

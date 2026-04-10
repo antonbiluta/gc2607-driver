@@ -33,8 +33,11 @@ log "Kernel: $KERN"
 
 # ── Stop service ───────────────────────────────────────────────────────
 log "Stopping service..."
+systemctl stop gc2607-isp.service 2>/dev/null || true
+systemctl disable gc2607-isp.service 2>/dev/null || true
 systemctl stop gc2607-camera.service 2>/dev/null || true
 systemctl disable gc2607-camera.service 2>/dev/null || true
+rm -f /etc/systemd/system/gc2607-isp.service
 rm -f /etc/systemd/system/gc2607-camera.service
 systemctl daemon-reload
 
@@ -60,7 +63,13 @@ rm -rf "/usr/src/gc2607-1.0" "/usr/src/ipu-bridge-gc2607-1.0"
 orig_backup="${BACKUP_DIR}/ipu_bridge.ko.xz.orig"
 if [ -f "$orig_backup" ]; then
     log "Restoring original ipu_bridge.ko..."
-    orig_dst="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
+    orig_dst=$(modinfo -F filename ipu_bridge 2>/dev/null || true)
+    if [ -z "$orig_dst" ]; then
+        orig_dst=$(find "/lib/modules/${KERN}/kernel" \
+            \( -name "ipu_bridge.ko*" -o -name "ipu-bridge.ko*" \) \
+            2>/dev/null | head -1)
+    fi
+    [ -n "$orig_dst" ] || orig_dst="/lib/modules/${KERN}/kernel/drivers/media/pci/intel/ipu_bridge.ko.xz"
     cp "$orig_backup" "$orig_dst"
     log "Restored: $orig_dst"
 else
@@ -83,7 +92,9 @@ rm -rf /etc/gc2607
 log "Removing wireplumber config..."
 # Remove for all users that have it
 for conf in /home/*/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf \
-            /root/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf; do
+            /home/*/.config/wireplumber/wireplumber.conf.d/50-gc2607-routing.conf \
+            /root/.config/wireplumber/wireplumber.conf.d/50-hide-ipu6-raw.conf \
+            /root/.config/wireplumber/wireplumber.conf.d/50-gc2607-routing.conf; do
     [ -f "$conf" ] && rm -f "$conf" && log "Removed: $conf"
 done
 

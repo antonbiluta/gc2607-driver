@@ -31,6 +31,18 @@ find_media_dev() {
 # ── Find the V4L2 capture node for "Intel IPU6 ISYS Capture 0" ─────────
 find_capture_dev() {
     local mdev="$1"
+    local cap_entity
+    cap_entity=$(media-ctl -d "$mdev" --print-topology 2>/dev/null | \
+        sed -n 's/.*"\(Intel IPU6 ISYS Capture[^"]*\)".*/\1/p' | head -1)
+    if [ -n "$cap_entity" ]; then
+        local node_by_entity
+        node_by_entity=$(media-ctl -d "$mdev" -e "$cap_entity" 2>/dev/null || true)
+        if [ -n "$node_by_entity" ] && [ -e "$node_by_entity" ]; then
+            echo "$node_by_entity"
+            return 0
+        fi
+    fi
+
     # media-ctl -e returns the /dev/videoX path for a named entity
     local node
     node=$(media-ctl -d "$mdev" -e "Intel IPU6 ISYS Capture 0" 2>/dev/null || true)
@@ -93,13 +105,27 @@ log "Capture device: $CAP_DEV"
 # The link must be enabled before opening the capture device.
 # We set it here once; gc2607_isp keeps it enabled while streaming.
 # If already enabled (e.g. after a service restart), the command is a no-op.
-log "Enabling media link..."
-media-ctl -d "$MEDIA_DEV" \
-    -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null || true
+CSI_ENTITY=$(media-ctl -d "$MEDIA_DEV" --print-topology 2>/dev/null | \
+    sed -n 's/.*"\(Intel IPU6 CSI2 [^"]*\)".*/\1/p' | head -1)
+CAP_ENTITY=$(media-ctl -d "$MEDIA_DEV" --print-topology 2>/dev/null | \
+    sed -n 's/.*"\(Intel IPU6 ISYS Capture[^"]*\)".*/\1/p' | head -1)
+if [ -n "$CSI_ENTITY" ] && [ -n "$CAP_ENTITY" ]; then
+    log "Enabling media link: $CSI_ENTITY -> $CAP_ENTITY"
+    media-ctl -d "$MEDIA_DEV" \
+        -l "\"${CSI_ENTITY}\":1 -> \"${CAP_ENTITY}\":0[1]" 2>/dev/null || true
+else
+    warn "Could not detect CSI/Capture entities for media link setup (continuing)"
+fi
 
 # Also configure the sensor pad format so IPU6 knows what to expect
-media-ctl -d "$MEDIA_DEV" \
-    --set-v4l2 '"gc2607 5-0037":0[fmt:SGRBG10_1X10/1920x1080]' 2>/dev/null || true
+SENSOR_ENTITY=$(media-ctl -d "$MEDIA_DEV" --print-topology 2>/dev/null | \
+    sed -n 's/.*"\([^"]*[Gg][Cc]2607[^"]*\)".*/\1/p' | head -1)
+if [ -n "$SENSOR_ENTITY" ]; then
+    media-ctl -d "$MEDIA_DEV" \
+        --set-v4l2 "\"${SENSOR_ENTITY}\":0[fmt:SGRBG10_1X10/1920x1080]" 2>/dev/null || true
+else
+    warn "GC2607 sensor entity not found for explicit format set (continuing)"
+fi
 
 # ── Set capture pixel format ─────────────────────────────────────────────
 v4l2-ctl -d "$CAP_DEV" \
