@@ -821,16 +821,34 @@ verify_runtime() {
     [ -e /dev/video50 ] || die "/dev/video50 not found (v4l2loopback routing not ready)"
 
     local smoke="/tmp/gc2607-smoke-test.yuv"
-    if ! timeout 20 v4l2-ctl -d /dev/video50 \
-        --stream-mmap=3 --stream-count=30 --stream-to="$smoke" >/dev/null 2>&1; then
-        warn "Smoke test failed. Recent logs:"
-        journalctl -u gc2607-camera.service -u gc2607-isp.service -n 80 --no-pager || true
-        die "Failed to capture test frames from /dev/video50"
-    fi
-
-    if [ ! -s "$smoke" ]; then
+    local smoke_ok=0
+    local attempt
+    for attempt in 1 2 3; do
         rm -f "$smoke"
-        die "Smoke test produced empty output on /dev/video50"
+
+        # On some machines the first run is too early: ISP is up but not yet pushing frames.
+        # Retry with a short settle delay and restart ISP between attempts.
+        if [ "$attempt" -gt 1 ]; then
+            warn "Smoke test retry ${attempt}/3: restarting gc2607-isp.service"
+            systemctl restart gc2607-isp.service 2>/dev/null || true
+            sleep 3
+        fi
+
+        if timeout 35 v4l2-ctl -d /dev/video50 \
+            --stream-mmap=3 --stream-count=60 --stream-to="$smoke" >/dev/null 2>&1; then
+            if [ -s "$smoke" ]; then
+                smoke_ok=1
+                break
+            fi
+        fi
+        sleep 2
+    done
+
+    if [ "$smoke_ok" -ne 1 ]; then
+        rm -f "$smoke"
+        warn "Smoke test failed. Recent logs:"
+        journalctl -u gc2607-camera.service -u gc2607-isp.service -n 120 --no-pager || true
+        die "Failed to capture non-empty frames from /dev/video50 after retries"
     fi
     rm -f "$smoke"
 

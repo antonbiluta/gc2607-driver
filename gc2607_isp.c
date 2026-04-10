@@ -448,8 +448,10 @@ static int count_readers(const char *dev)
         struct dirent *fe;
         while ((fe = readdir(fds)) != NULL && !found) {
             if (fe->d_name[0] == '.') continue;
-            char link[128];
-            snprintf(link, sizeof(link), "/proc/%d/fd/%s", pid, fe->d_name);
+            char link[PATH_MAX];
+            int n = snprintf(link, sizeof(link), "/proc/%d/fd/%s", pid, fe->d_name);
+            if (n < 0 || n >= (int)sizeof(link))
+                continue;
             struct stat lst;
             if (stat(link, &lst) == 0 &&
                 lst.st_dev == target.st_dev &&
