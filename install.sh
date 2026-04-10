@@ -452,11 +452,15 @@ install_files() {
     cp "$SCRIPT_DIR/gc2607-service.sh"             "$INSTALL_DIR/"
     cp "$SCRIPT_DIR/gc2607-isp-start.sh"           "$INSTALL_DIR/"
     cp "$SCRIPT_DIR/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607-settings"               "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607-settings-helper.sh"     "$INSTALL_DIR/"
 
     chmod +x "$INSTALL_DIR/gc2607_isp"
     chmod +x "$INSTALL_DIR/gc2607-service.sh"
     chmod +x "$INSTALL_DIR/gc2607-isp-start.sh"
     chmod +x "$INSTALL_DIR/gc2607-restart-wireplumber.sh"
+    chmod +x "$INSTALL_DIR/gc2607-settings"
+    chmod +x "$INSTALL_DIR/gc2607-settings-helper.sh"
 
     # Fix SCRIPT_DIR inside service script
     sed -i "s|^SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" \
@@ -495,6 +499,47 @@ EOF
         log "Created $CONF_FILE"
     else
         log "Keeping existing $CONF_FILE"
+    fi
+}
+
+# ── Phase 6b: Settings app + polkit ───────────────────────────────────
+install_settings_app() {
+    log "=== Phase 6b: Installing settings app ==="
+
+    # Make config file group-writable so the GUI can write without pkexec
+    # when the user is in the 'gc2607' group (added below).
+    groupadd -f gc2607 2>/dev/null || true
+    local user; user=$(real_user)
+    if [ -n "$user" ]; then
+        usermod -aG gc2607 "$user" 2>/dev/null || true
+    fi
+    chown root:gc2607 /etc/gc2607 2>/dev/null || true
+    chmod 775 /etc/gc2607 2>/dev/null || true
+    [ -f "$CONF_FILE" ] && chown root:gc2607 "$CONF_FILE" && chmod 664 "$CONF_FILE" || true
+
+    # polkit rule: allow gc2607 group to run the helper without password
+    mkdir -p /etc/polkit-1/rules.d
+    cat > /etc/polkit-1/rules.d/50-gc2607.rules <<'POLKIT'
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "/opt/gc2607/gc2607-settings-helper.sh" &&
+        subject.isInGroup("gc2607")) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+
+    # .desktop file → visible in GNOME app drawer
+    cp "$SCRIPT_DIR/gc2607-settings.desktop" \
+        /usr/share/applications/gc2607-settings.desktop
+    chmod 644 /usr/share/applications/gc2607-settings.desktop
+
+    # Symlink binary so it's in PATH
+    ln -sf "$INSTALL_DIR/gc2607-settings" /usr/local/bin/gc2607-settings 2>/dev/null || true
+
+    log "Settings app installed — launch 'GC2607 Camera Settings' from GNOME or run: gc2607-settings"
+    if [ -n "$user" ]; then
+        warn "Group membership for '$user' takes effect on next login (or run: newgrp gc2607)"
     fi
 }
 
@@ -757,8 +802,8 @@ show_status() {
     echo "  Open any camera app — it will find 'GC2607 Camera' (/dev/video50)"
     echo "  LED turns on only when an app is actively reading the camera"
     echo ""
-    echo "  Config:        $CONF_FILE"
-    echo "  Apply config:  sudo systemctl restart gc2607-isp.service"
+    echo "  Settings GUI:  gc2607-settings   (or search GNOME apps)"
+    echo "  Config file:   $CONF_FILE        (changes apply instantly)"
     echo "  All logs:      journalctl -u gc2607-camera.service -u gc2607-isp.service -f"
     echo "  DKMS:          dkms status"
     echo ""
@@ -780,6 +825,7 @@ main() {
     build_isp
     install_files
     install_config
+    install_settings_app
     install_wireplumber
     install_service
     sign_modules

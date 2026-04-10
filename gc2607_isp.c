@@ -25,6 +25,7 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/inotify.h>
 #include <linux/videodev2.h>
 
 /* ── Sensor constants (fixed hardware) ─────────────────────────────── */
@@ -40,13 +41,19 @@
 #define SENSOR_FPS      30          /* Sensor always runs at 30fps */
 
 /* ── ISP tuning constants ───────────────────────────────────────────── */
-#define WB_SMOOTHING    0.85f
-#define WB_SUBSAMPLE    8
-#define AE_SMOOTHING    0.92f
-#define AE_INTERVAL_S   1.5
-#define BRIGHTNESS_MIN  0.3f
-#define BRIGHTNESS_MAX  4.0f
-#define NUM_BUFFERS     4
+#define WB_SMOOTHING        0.88f   /* steady-state smoothing */
+#define WB_SMOOTHING_FAST   0.0f    /* first N frames: instant convergence */
+#define WB_FAST_FRAMES      20      /* frames before switching to smooth */
+#define WB_SUBSAMPLE        8
+#define AE_SMOOTHING        0.90f
+#define AE_SMOOTHING_FAST   0.50f   /* fast convergence at startup / scene change */
+#define AE_FAST_FRAMES      30      /* frames of fast AE after startup/scene change */
+#define AE_INTERVAL_S       0.8     /* how often to adjust hardware controls */
+#define AE_SCENE_CHANGE_THR 0.4f    /* brightness ratio that triggers fast AE */
+#define BRIGHTNESS_MIN      0.3f
+#define BRIGHTNESS_MAX      4.0f
+#define NUM_BUFFERS         4
+#define CONFIG_PATH         "/etc/gc2607/gc2607.conf"
 
 /* ── White balance preset R/B gains (green=1.0) ─────────────────────
  * Derived from typical spectral conditions; fine-tune if needed.     */
@@ -74,7 +81,10 @@ static int   cfg_rotation  = 180;    /* 0 or 180 — sensor is mounted upside-do
 static int OUT_W, OUT_H;
 
 /* ── State ──────────────────────────────────────────────────────────── */
-static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t running      = 1;
+static volatile sig_atomic_t config_dirty = 0; /* set by inotify watcher */
+
+static void sighup_handler(int sig) { (void)sig; config_dirty = 1; }
 
 struct buffer { void *start; size_t length; };
 
@@ -504,6 +514,7 @@ int main(int argc, char *argv[])
 
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGHUP,  sighup_handler); /* kill -HUP → reload config */
 
     /* Sensor subdev for hardware AE */
     char subdev_path[64] = {0};
@@ -517,6 +528,11 @@ int main(int argc, char *argv[])
     if (has_subdev)
         set_sensor_controls(subdev_path, cur_exposure, cur_gain);
 
+    /* inotify: watch config file for live settings reload */
+    int inotify_fd = inotify_init1(IN_NONBLOCK);
+    if (inotify_fd >= 0)
+        inotify_add_watch(inotify_fd, CONFIG_PATH, IN_CLOSE_WRITE | IN_MOVED_TO);
+
     struct buffer bufs[NUM_BUFFERS];
     int n_bufs = 0;
     int cap_fd = open_capture(capture_dev, bufs, &n_bufs);
@@ -527,11 +543,16 @@ int main(int argc, char *argv[])
 
     printf("[gc2607_isp] Streaming %dx%d @ %dfps\n", OUT_W, OUT_H, cfg_fps);
     printf("[gc2607_isp] Sensor pauses automatically when no app uses the camera\n");
+    printf("[gc2607_isp] Config hot-reload: edit %s (changes apply immediately)\n",
+           CONFIG_PATH);
 
     /* ISP state */
-    float brightness   = 1.0f;
-    int   frame_count  = 0;
-    int   output_count = 0;
+    float brightness    = 1.0f;
+    float prev_bright8  = -1.0f; /* for scene-change detection */
+    int   frame_count   = 0;
+    int   output_count  = 0;
+    int   ae_fast_left  = AE_FAST_FRAMES; /* frames remaining in fast-AE mode */
+    int   wb_fast_left  = WB_FAST_FRAMES; /* frames remaining in fast-WB mode */
 
     /* Consumer-detection state machine:
      *   streaming=1 — sensor running, processing frames
@@ -597,65 +618,115 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        const uint16_t *bayer = (const uint16_t *)bufs[buf.index].start;
+        /* ── Config hot-reload (inotify + SIGHUP) ───────────────────── */
+        if (config_dirty) {
+            config_dirty = 0;
+            load_config(CONFIG_PATH);
+            OUT_W = cfg_half_res ? SENSOR_W/2 : SENSOR_W;
+            OUT_H = cfg_half_res ? SENSOR_H/2 : SENSOR_H;
+            /* re-parse WB mode */
+            if (!strcmp(cfg_wb_mode, "auto")) {
+                wb_auto = 1;
+            } else if (!strcmp(cfg_wb_mode, "manual")) {
+                wb_auto = 0; wb_r = cfg_wb_red; wb_b = cfg_wb_blue;
+            } else {
+                wb_auto = 0;
+                for (int pi = 0; WB_PRESETS[pi].name; pi++) {
+                    if (!strcmp(cfg_wb_mode, WB_PRESETS[pi].name)) {
+                        wb_r = WB_PRESETS[pi].r; wb_b = WB_PRESETS[pi].b; break;
+                    }
+                }
+            }
+            /* trigger fast convergence after settings change */
+            ae_fast_left = AE_FAST_FRAMES;
+            wb_fast_left = WB_FAST_FRAMES;
+            printf("[gc2607_isp] Config reloaded: res=%dx%d fps=%d bright=%.0f wb=%s\n",
+                   OUT_W, OUT_H, cfg_fps, (double)cfg_brightness, cfg_wb_mode);
+        }
+        /* drain inotify events */
+        if (inotify_fd >= 0) {
+            char ibuf[256];
+            while (read(inotify_fd, ibuf, sizeof(ibuf)) > 0) config_dirty = 1;
+        }
 
-        /* WB gains for this frame */
-        float fr = wb_r;
-        float fb = wb_b;
+        const uint16_t *bayer = (const uint16_t *)bufs[buf.index].start;
 
         /* Process frame */
         float r_mean, g_mean, b_mean;
         int   stat_count;
-        build_luts(fr, 1.0f, fb, brightness);
+        build_luts(wb_r, 1.0f, wb_b, brightness);
 
         if (cfg_half_res)
             demosaic_half(bayer, &r_mean, &g_mean, &b_mean, &stat_count);
         else
             demosaic_full(bayer, &r_mean, &g_mean, &b_mean, &stat_count);
 
-        /* Gray-world AWB update */
+        /* ── Gray-world AWB ──────────────────────────────────────────── */
         if (wb_auto && r_mean > 1.0f && g_mean > 1.0f && b_mean > 1.0f) {
             float nr = g_mean / r_mean;
             float nb = g_mean / b_mean;
             if (nr > 4.0f)  nr = 4.0f;  if (nr < 0.25f) nr = 0.25f;
             if (nb > 4.0f)  nb = 4.0f;  if (nb < 0.25f) nb = 0.25f;
-            float sm = output_count < 10 ? 0.0f : WB_SMOOTHING;
+            float sm = (wb_fast_left > 0) ? WB_SMOOTHING_FAST : WB_SMOOTHING;
             wb_r = sm * wb_r + (1.0f - sm) * nr;
             wb_b = sm * wb_b + (1.0f - sm) * nb;
+            if (wb_fast_left > 0) wb_fast_left--;
         }
 
-        /* Software AE */
+        /* ── Software AE ─────────────────────────────────────────────── */
         float cur_bright8 = g_mean * brightness / MAX_SIGNAL * 255.0f;
+
+        /* Scene change detection: sudden brightness shift → fast AE */
+        if (prev_bright8 > 1.0f && cur_bright8 > 1.0f) {
+            float ratio = cur_bright8 / prev_bright8;
+            if (ratio > (1.0f + AE_SCENE_CHANGE_THR) ||
+                ratio < (1.0f - AE_SCENE_CHANGE_THR)) {
+                ae_fast_left = AE_FAST_FRAMES;
+            }
+        }
+        prev_bright8 = cur_bright8;
+
         if (cur_bright8 > 1.0f) {
+            float ae_sm = (ae_fast_left > 0) ? AE_SMOOTHING_FAST : AE_SMOOTHING;
             float ratio = cfg_brightness / cur_bright8;
-            brightness = AE_SMOOTHING * brightness + (1.0f - AE_SMOOTHING) * (brightness * ratio);
+            brightness = ae_sm * brightness + (1.0f - ae_sm) * (brightness * ratio);
             if (brightness < BRIGHTNESS_MIN) brightness = BRIGHTNESS_MIN;
             if (brightness > BRIGHTNESS_MAX) brightness = BRIGHTNESS_MAX;
+            if (ae_fast_left > 0) ae_fast_left--;
         }
 
-        /* Hardware AE */
+        /* ── Hardware AE (exposure + gain) ──────────────────────────── */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = (now.tv_sec - last_ae_time.tv_sec) +
                          (now.tv_nsec - last_ae_time.tv_nsec) / 1e9;
-        if (has_subdev && elapsed >= AE_INTERVAL_S) {
-            if (brightness > 2.5f) {
+        double ae_interval = (ae_fast_left > 0) ? (AE_INTERVAL_S / 3.0) : AE_INTERVAL_S;
+        if (has_subdev && elapsed >= ae_interval) {
+            int changed = 0;
+            if (brightness > 2.0f) {
+                /* Too dark — raise exposure first, then gain */
                 if (cur_exposure < EXPOSURE_MAX) {
-                    cur_exposure = (int)(cur_exposure * 1.5);
+                    cur_exposure = (int)(cur_exposure * (ae_fast_left > 0 ? 2.0 : 1.4));
                     if (cur_exposure > EXPOSURE_MAX) cur_exposure = EXPOSURE_MAX;
                 } else if (cur_gain < GAIN_MAX) {
-                    cur_gain += 2;
+                    cur_gain += (ae_fast_left > 0 ? 3 : 1);
                     if (cur_gain > GAIN_MAX) cur_gain = GAIN_MAX;
                 }
-                set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+                changed = 1;
                 brightness = 1.0f;
-            } else if (brightness < 0.8f && (cur_exposure > EXPOSURE_MIN || cur_gain > GAIN_MIN)) {
-                cur_exposure = (int)(cur_exposure * 0.7);
-                if (cur_exposure < EXPOSURE_MIN) cur_exposure = EXPOSURE_MIN;
-                if (cur_exposure == EXPOSURE_MIN && cur_gain > GAIN_MIN) cur_gain--;
-                set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+            } else if (brightness < 0.6f && (cur_exposure > EXPOSURE_MIN || cur_gain > GAIN_MIN)) {
+                /* Too bright — lower gain first, then exposure */
+                if (cur_gain > GAIN_MIN) {
+                    cur_gain -= (ae_fast_left > 0 ? 3 : 1);
+                    if (cur_gain < GAIN_MIN) cur_gain = GAIN_MIN;
+                } else {
+                    cur_exposure = (int)(cur_exposure * (ae_fast_left > 0 ? 0.4 : 0.75));
+                    if (cur_exposure < EXPOSURE_MIN) cur_exposure = EXPOSURE_MIN;
+                }
+                changed = 1;
                 brightness = 1.0f;
             }
+            if (changed) set_sensor_controls(subdev_path, cur_exposure, cur_gain);
             last_ae_time = now;
         }
 
@@ -705,5 +776,6 @@ int main(int argc, char *argv[])
     for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
     close(cap_fd);
     close(out_fd);
+    if (inotify_fd >= 0) close(inotify_fd);
     return 0;
 }
