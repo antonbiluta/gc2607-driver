@@ -341,7 +341,7 @@ static int open_capture(const char *dev, struct buffer *bufs, int *n)
 
 static int open_output(const char *dev)
 {
-    int fd = open(dev, O_RDWR);
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) { perror("open output"); return -1; }
     struct v4l2_format fmt = {0};
     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
@@ -526,21 +526,66 @@ int main(int argc, char *argv[])
     if (out_fd < 0) { close(cap_fd); return 1; }
 
     printf("[gc2607_isp] Streaming %dx%d @ %dfps\n", OUT_W, OUT_H, cfg_fps);
+    printf("[gc2607_isp] Sensor pauses automatically when no app uses the camera\n");
 
     /* ISP state */
     float brightness   = 1.0f;
     int   frame_count  = 0;
     int   output_count = 0;
 
+    /* Consumer-detection state machine:
+     *   streaming=1 — sensor running, processing frames
+     *   streaming=0 — STREAMOFF issued, waiting for a consumer on output_dev
+     * After IDLE_THRESHOLD consecutive EAGAIN writes we STREAMOFF (LED off).
+     * We probe /dev/videoN by writing a gray frame; first success restarts. */
+#define IDLE_THRESHOLD  90   /* ~3 s at 30 fps */
+    int streaming     = 1;
+    int eagain_streak = 0;
+
+    size_t frame_bytes = (size_t)(OUT_W * OUT_H * 2);
+
     struct timespec last_ae_time;
     clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
 
     while (running) {
+
+        /* ── Idle: sensor off, poll for consumer ─────────────────────── */
+        if (!streaming) {
+            /* Write a gray frame to probe whether a consumer is reading */
+            memset(flip_buf, 0x80, frame_bytes); /* 0x80 = neutral gray YUYV */
+            ssize_t probe = write(out_fd, flip_buf, frame_bytes);
+            if (probe > 0) {
+                /* Consumer appeared — re-queue all buffers and restart */
+                for (int ri = 0; ri < n_bufs; ri++) {
+                    struct v4l2_buffer qb = {0};
+                    qb.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                    qb.memory = V4L2_MEMORY_MMAP;
+                    qb.index  = ri;
+                    xioctl(cap_fd, VIDIOC_QBUF, &qb);
+                }
+                enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                if (xioctl(cap_fd, VIDIOC_STREAMON, &st) == 0) {
+                    streaming     = 1;
+                    eagain_streak = 0;
+                    if (has_subdev)
+                        set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+                    printf("[gc2607_isp] Consumer detected — sensor started (LED on)\n");
+                } else {
+                    perror("[gc2607_isp] VIDIOC_STREAMON");
+                    usleep(5000000);
+                }
+            } else {
+                usleep(2000000); /* 2 s between probes */
+            }
+            continue;
+        }
+
+        /* ── Streaming ───────────────────────────────────────────────── */
         struct v4l2_buffer buf = {0};
         buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
         if (xioctl(cap_fd, VIDIOC_DQBUF, &buf) < 0) {
-            if (errno == EAGAIN) continue;
+            if (errno == EAGAIN) { usleep(1000); continue; }
             perror("VIDIOC_DQBUF"); break;
         }
 
@@ -555,8 +600,8 @@ int main(int argc, char *argv[])
         const uint16_t *bayer = (const uint16_t *)bufs[buf.index].start;
 
         /* WB gains for this frame */
-        float fr = wb_auto ? wb_r : wb_r;
-        float fb = wb_auto ? wb_b : wb_b;
+        float fr = wb_r;
+        float fb = wb_b;
 
         /* Process frame */
         float r_mean, g_mean, b_mean;
@@ -572,10 +617,8 @@ int main(int argc, char *argv[])
         if (wb_auto && r_mean > 1.0f && g_mean > 1.0f && b_mean > 1.0f) {
             float nr = g_mean / r_mean;
             float nb = g_mean / b_mean;
-            if (nr > 4.0f)  { nr = 4.0f;  }
-            if (nr < 0.25f) { nr = 0.25f; }
-            if (nb > 4.0f)  { nb = 4.0f;  }
-            if (nb < 0.25f) { nb = 0.25f; }
+            if (nr > 4.0f)  nr = 4.0f;  if (nr < 0.25f) nr = 0.25f;
+            if (nb > 4.0f)  nb = 4.0f;  if (nb < 0.25f) nb = 0.25f;
             float sm = output_count < 10 ? 0.0f : WB_SMOOTHING;
             wb_r = sm * wb_r + (1.0f - sm) * nr;
             wb_b = sm * wb_b + (1.0f - sm) * nb;
@@ -617,20 +660,36 @@ int main(int argc, char *argv[])
         }
 
         /* Output (with optional 180° rotation) */
-        size_t frame_bytes = (size_t)(OUT_W * OUT_H * 2);
         const uint8_t *out_ptr = yuyv_buf;
         if (cfg_rotation == 180) {
             rotate180_yuyv(yuyv_buf, flip_buf, OUT_W, OUT_H);
             out_ptr = flip_buf;
         }
         ssize_t wr = write(out_fd, out_ptr, frame_bytes);
-        if (wr < 0 && errno != EAGAIN) { perror("write output"); break; }
 
+        /* Return buffer to capture queue */
         if (xioctl(cap_fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF"); break; }
+
+        /* Track consecutive EAGAIN to detect "no consumers" */
+        if (wr < 0) {
+            if (errno == EAGAIN) {
+                if (++eagain_streak >= IDLE_THRESHOLD) {
+                    printf("[gc2607_isp] No consumers — pausing sensor (LED off)\n");
+                    enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                    xioctl(cap_fd, VIDIOC_STREAMOFF, &st);
+                    streaming     = 0;
+                    eagain_streak = 0;
+                }
+            } else {
+                perror("write output"); break;
+            }
+        } else {
+            eagain_streak = 0;
+        }
 
         output_count++;
         if (output_count % 150 == 0) {
-            printf("[gc2607_isp] %d frames out | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d\n",
+            printf("[gc2607_isp] %d frames | WB: R=%.2f B=%.2f | bright=%.2f | exp=%d gain=%d\n",
                    output_count, (double)wb_r, (double)wb_b, (double)brightness,
                    cur_exposure, cur_gain);
         }
@@ -639,8 +698,10 @@ int main(int argc, char *argv[])
     printf("[gc2607_isp] Shutdown (%d sensor frames, %d output frames)\n",
            frame_count, output_count);
 
-    enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    xioctl(cap_fd, VIDIOC_STREAMOFF, &t);
+    if (streaming) {
+        enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        xioctl(cap_fd, VIDIOC_STREAMOFF, &t);
+    }
     for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
     close(cap_fd);
     close(out_fd);

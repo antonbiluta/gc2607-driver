@@ -440,21 +440,23 @@ build_isp() {
 install_files() {
     log "=== Phase 5: Installing to $INSTALL_DIR ==="
 
-    # Stop service first — otherwise running gc2607_isp binary can't be overwritten
+    # Stop both services first — otherwise running gc2607_isp binary can't be overwritten
+    systemctl stop gc2607-isp.service    2>/dev/null || true
     systemctl stop gc2607-camera.service 2>/dev/null || true
     sleep 1
 
     mkdir -p "$INSTALL_DIR"
 
     cp "$SCRIPT_DIR/gc2607_isp"                    "$INSTALL_DIR/"
-    cp "$SCRIPT_DIR/gc2607_virtualcam.py"          "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607_virtualcam.py"          "$INSTALL_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/gc2607-service.sh"             "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/gc2607-isp-start.sh"           "$INSTALL_DIR/"
     cp "$SCRIPT_DIR/gc2607-restart-wireplumber.sh" "$INSTALL_DIR/"
 
     chmod +x "$INSTALL_DIR/gc2607_isp"
     chmod +x "$INSTALL_DIR/gc2607-service.sh"
+    chmod +x "$INSTALL_DIR/gc2607-isp-start.sh"
     chmod +x "$INSTALL_DIR/gc2607-restart-wireplumber.sh"
-    chmod +x "$INSTALL_DIR/gc2607_virtualcam.py"
 
     # Fix SCRIPT_DIR inside service script
     sed -i "s|^SCRIPT_DIR=.*|SCRIPT_DIR=\"${INSTALL_DIR}\"|" \
@@ -529,10 +531,11 @@ EOF
     log "Wireplumber config installed for user: $user"
 }
 
-# ── Phase 8: Systemd service ───────────────────────────────────────────
+# ── Phase 8: Systemd services ──────────────────────────────────────────
 install_service() {
-    log "=== Phase 8: Systemd service ==="
+    log "=== Phase 8: Systemd services ==="
 
+    # gc2607-camera.service — oneshot: load modules and verify media topology
     cat > /etc/systemd/system/gc2607-camera.service <<EOF
 [Unit]
 Description=GC2607 Camera Driver Setup
@@ -552,9 +555,30 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
+    # gc2607-isp.service — persistent: ISP pipeline /dev/videoX → /dev/video50
+    # gc2607_isp auto-pauses when no app reads /dev/video50 (LED turns off)
+    cat > /etc/systemd/system/gc2607-isp.service <<EOF
+[Unit]
+Description=GC2607 ISP Pipeline (raw sensor → /dev/video50)
+After=gc2607-camera.service
+Requires=gc2607-camera.service
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/gc2607-isp-start.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     systemctl daemon-reload
     systemctl enable gc2607-camera.service
-    log "Service installed and enabled"
+    systemctl enable gc2607-isp.service
+    log "Services installed and enabled"
 }
 
 # ── Phase 9: Sign modules (Secure Boot) ───────────────────────────────
@@ -589,48 +613,110 @@ sign_modules() {
     [ -f "$sign_cmd" ] || sign_cmd="$(which sign-file 2>/dev/null)" || \
         { warn "sign-file not found, modules not signed"; return; }
 
-    for ko in $(find "/lib/modules/${KERN}" -name "gc2607.ko" -o \
-                     -name "ipu_bridge.ko" 2>/dev/null); do
-        "$sign_cmd" sha256 "$mok_key" "$mok_cert" "$ko"
-        log "Signed: $ko"
-    done
+    local tmp; tmp=$(mktemp -d)
+
+    # Modules may be .ko or .ko.xz — handle both
+    # Pattern covers gc2607, ipu_bridge, ipu-bridge (Fedora dash naming)
+    while IFS= read -r -d '' ko_path; do
+        if [[ "$ko_path" == *.xz ]]; then
+            # Decompress → sign → recompress → replace
+            local ko_name; ko_name=$(basename "${ko_path%.xz}")
+            if ! xz -dc "$ko_path" > "$tmp/$ko_name" 2>/dev/null; then
+                warn "Failed to decompress $ko_path, skipping"; continue
+            fi
+            if ! "$sign_cmd" sha256 "$mok_key" "$mok_cert" "$tmp/$ko_name" 2>/dev/null; then
+                warn "sign-file failed for $ko_path, skipping"; continue
+            fi
+            if ! xz -9 --check=crc32 "$tmp/$ko_name" 2>/dev/null; then
+                warn "Recompression failed for $ko_path, skipping"; continue
+            fi
+            cp "$tmp/${ko_name}.xz" "$ko_path"
+            rm -f "$tmp/$ko_name" "$tmp/${ko_name}.xz"
+            log "Signed (xz): $ko_path"
+        else
+            if "$sign_cmd" sha256 "$mok_key" "$mok_cert" "$ko_path" 2>/dev/null; then
+                log "Signed: $ko_path"
+            else
+                warn "sign-file failed for $ko_path"
+            fi
+        fi
+    done < <(find "/lib/modules/${KERN}" \
+        \( -name "gc2607.ko"        -o -name "gc2607.ko.xz" \
+           -o -name "ipu_bridge.ko" -o -name "ipu_bridge.ko.xz" \
+           -o -name "ipu-bridge.ko" -o -name "ipu-bridge.ko.xz" \) \
+        -print0 2>/dev/null)
+
+    rm -rf "$tmp"
+    depmod -a "$KERN"
 }
 
-# ── Phase 10: Start service ────────────────────────────────────────────
+# ── Phase 10: Start services ───────────────────────────────────────────
 start_camera() {
     log "=== Phase 10: Starting camera ==="
 
+    systemctl stop gc2607-isp.service    2>/dev/null || true
     systemctl stop gc2607-camera.service 2>/dev/null || true
     sleep 1
 
-    # Try to reload module stack so the newly built modules take effect.
-    # If modules are busy (e.g. another service holds them), suggest reboot.
-    local need_reboot=0
-    for mod in gc2607 intel-ipu6-isys intel-ipu6 ipu_bridge; do
-        if grep -q "^${mod} " /proc/modules 2>/dev/null; then
-            if ! modprobe -r "$mod" 2>/dev/null; then
-                warn "Cannot unload $mod (device busy)"
-                need_reboot=1
+    # Check if the patched ipu_bridge is already loaded in memory.
+    # If so, no module reload is needed — just restart the services.
+    local ipu_loaded=0
+    local ipu_patched=0
+    if grep -q "^ipu_bridge " /proc/modules 2>/dev/null; then
+        ipu_loaded=1
+        # Check if the currently loaded module has GC2607 support
+        # (the in-memory binary contains the GCTI2607 string)
+        local ipu_mod_path
+        ipu_mod_path=$(modinfo -F filename ipu_bridge 2>/dev/null || true)
+        if [ -n "$ipu_mod_path" ]; then
+            if [[ "$ipu_mod_path" == *.xz ]]; then
+                xz -dc "$ipu_mod_path" 2>/dev/null | grep -qa "GCTI2607" && ipu_patched=1
+            else
+                grep -qa "GCTI2607" "$ipu_mod_path" 2>/dev/null && ipu_patched=1
             fi
         fi
-    done
-
-    if [ "$need_reboot" -eq 1 ]; then
-        echo ""
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo -e "${YELLOW}⚠  Installation complete. Reboot required.${NC}"
-        echo ""
-        echo "  Some modules are in use and cannot be reloaded live."
-        echo "  After reboot the camera will be ready automatically."
-        echo ""
-        echo "  sudo reboot"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        save_state
-        exit 0
     fi
 
+    if [ "$ipu_loaded" -eq 1 ] && [ "$ipu_patched" -eq 1 ]; then
+        # Patched modules are already loaded — no need to reload anything.
+        log "Patched ipu_bridge already loaded — skipping module reload"
+    else
+        # Try to unload and reload the module stack so the patched modules take effect.
+        # If any module is busy, a single reboot is needed.
+        local need_reboot=0
+        for mod in gc2607 intel-ipu6-isys intel-ipu6 ipu_bridge; do
+            if grep -q "^${mod} " /proc/modules 2>/dev/null; then
+                if ! modprobe -r "$mod" 2>/dev/null; then
+                    warn "Cannot unload $mod (device busy)"
+                    need_reboot=1
+                fi
+            fi
+        done
+
+        if [ "$need_reboot" -eq 1 ]; then
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo -e "${YELLOW}⚠  Installation complete. Reboot required.${NC}"
+            echo ""
+            echo "  Modules are in use and cannot be reloaded live."
+            echo "  After reboot the camera will be ready automatically."
+            echo ""
+            echo "  sudo reboot"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            save_state
+            exit 0
+        fi
+    fi
+
+    # Load v4l2loopback for /dev/video50 (ISP output)
+    modprobe v4l2loopback video_nr=50 card_label="GC2607 Camera" \
+        exclusive_caps=1 2>/dev/null || true
+
     systemctl start gc2607-camera.service || \
-        die "Service failed to start. Check: journalctl -u gc2607-camera.service -n 30"
+        die "Camera setup failed. Check: journalctl -u gc2607-camera.service -n 30"
+
+    systemctl start gc2607-isp.service || \
+        warn "ISP service failed to start immediately (will retry automatically)"
 
     log "Camera ready. LED activates only when an app opens the camera."
 }
@@ -654,19 +740,27 @@ show_status() {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     if systemctl is-active --quiet gc2607-camera.service; then
-        echo -e "${GREEN}✓ Camera service is running${NC}"
-        echo ""
-        echo "  Open camera app and select 'GC2607 Camera'"
+        echo -e "${GREEN}✓ gc2607-camera  (module setup)   — OK${NC}"
     else
-        echo -e "${RED}✗ Camera service is NOT running${NC}"
-        echo ""
-        echo "  Check logs: journalctl -u gc2607-camera.service -n 30"
+        echo -e "${RED}✗ gc2607-camera  (module setup)   — NOT running${NC}"
+        echo "    Check: journalctl -u gc2607-camera.service -n 30"
     fi
+
+    if systemctl is-active --quiet gc2607-isp.service; then
+        echo -e "${GREEN}✓ gc2607-isp     (ISP pipeline)   — running${NC}"
+    else
+        echo -e "${YELLOW}⚠ gc2607-isp     (ISP pipeline)   — not running yet${NC}"
+        echo "    Check: journalctl -u gc2607-isp.service -n 30"
+    fi
+
     echo ""
-    echo "  Config:   $CONF_FILE"
-    echo "  Restart:  sudo systemctl restart gc2607-camera.service"
-    echo "  Logs:     journalctl -u gc2607-camera.service -f"
-    echo "  DKMS:     dkms status"
+    echo "  Open any camera app — it will find 'GC2607 Camera' (/dev/video50)"
+    echo "  LED turns on only when an app is actively reading the camera"
+    echo ""
+    echo "  Config:        $CONF_FILE"
+    echo "  Apply config:  sudo systemctl restart gc2607-isp.service"
+    echo "  All logs:      journalctl -u gc2607-camera.service -u gc2607-isp.service -f"
+    echo "  DKMS:          dkms status"
     echo ""
     echo "  After kernel update: sudo ./install.sh  (DKMS usually handles it)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
