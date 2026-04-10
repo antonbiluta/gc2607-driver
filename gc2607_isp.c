@@ -605,10 +605,10 @@ int main(int argc, char *argv[])
     int  cap_fd   = -1;
     int  streaming = 0;   /* 1 = sensor open + STREAMON */
 
-#define READER_CHECK_INTERVAL_S  2   /* how often to poll /proc for readers */
+#define READER_CHECK_INTERVAL_S  1   /* how often to poll /proc for readers */
 /* Stop only after several consecutive "no readers" checks to avoid
  * rapid on/off oscillation when apps switch camera sessions. */
-#define NO_READER_STOP_CHECKS    3
+#define NO_READER_STOP_CHECKS    2
     struct timespec last_reader_check = {0};
     struct timespec last_ae_time      = {0};
     clock_gettime(CLOCK_MONOTONIC, &last_reader_check);
