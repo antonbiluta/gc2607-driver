@@ -932,28 +932,35 @@ static int gc2607_probe(struct i2c_client *client)
 			vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	}
 
-	/* Sensor physical rotation — sensor is mounted upside-down (180°).
-	 * Must use the full kernel range [0, 270] step=90; restrict by
-	 * marking READ_ONLY. libcamera reads the default value (180°).
+	/* Sensor physical rotation — optional (may not be supported in all kernels).
+	 * If supported, libcamera reads the default (180°) and auto-rotates.
 	 */
 	{
 		struct v4l2_ctrl *rot;
 		rot = v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
 					V4L2_CID_CAMERA_SENSOR_ROTATION,
 					0, 270, 90, 180);
-		if (rot)
+		if (rot) {
 			rot->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+		} else if (gc2607->ctrls.error == -EINVAL) {
+			dev_dbg(dev, "SENSOR_ROTATION not supported by kernel, skipping\n");
+			gc2607->ctrls.error = 0;
+		}
 	}
 
-	/* Camera orientation: full range [0,2] required; default = front (0) */
+	/* Camera orientation — optional */
 	{
 		struct v4l2_ctrl *orient;
 		orient = v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
 					   V4L2_CID_CAMERA_ORIENTATION,
 					   0, 2, 1,
 					   V4L2_CAMERA_ORIENTATION_FRONT);
-		if (orient)
+		if (orient) {
 			orient->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+		} else if (gc2607->ctrls.error == -EINVAL) {
+			dev_dbg(dev, "CAMERA_ORIENTATION not supported by kernel, skipping\n");
+			gc2607->ctrls.error = 0;
+		}
 	}
 
 	gc2607->sd.ctrl_handler = &gc2607->ctrls;
