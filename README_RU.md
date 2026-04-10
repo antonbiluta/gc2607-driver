@@ -23,10 +23,18 @@ sudo ./install.sh
 Скрипт автоматически:
 - Устанавливает зависимости сборки
 - Собирает и регистрирует `gc2607.ko` через DKMS
-- Скачивает исходники ядра, патчит `ipu_bridge` для поддержки GC2607, регистрирует через DKMS
+- Использует локальные исходники ядра (fallback: tarball с kernel.org), патчит `ipu_bridge`, собирает через DKMS
 - Собирает C-ISP процессор (`gc2607_isp`, ~5% CPU против ~43% у Python-версии)
-- Устанавливает systemd-сервис с автозапуском при загрузке
-- Настраивает WirePlumber, чтобы приложения видели только `GC2607 Camera`, а не сырые IPU6-устройства
+- Устанавливает и включает systemd-сервисы (`gc2607-camera`, `gc2607-isp`)
+- Настраивает `v4l2loopback` как одно устройство (`/dev/video50`, `GC2607 Camera`)
+- Настраивает маршрутизацию WirePlumber и синхронизацию user media stack (PipeWire/portal)
+- Отключает конфликтующий `virtual-webcam.service`, если он есть
+
+После первой установки рекомендуется один раз перезагрузиться:
+
+```bash
+sudo reboot
+```
 
 ---
 
@@ -59,7 +67,7 @@ wb=auto                # auto, daylight, cloudy, shade,
 Применить изменения:
 
 ```bash
-sudo systemctl restart gc2607-camera.service
+sudo systemctl restart gc2607-isp.service
 ```
 
 ---
@@ -68,17 +76,40 @@ sudo systemctl restart gc2607-camera.service
 
 ```bash
 # Статус
-sudo systemctl status gc2607-camera.service
+sudo systemctl status gc2607-camera.service gc2607-isp.service
 
 # Логи в реальном времени
-journalctl -u gc2607-camera.service -f
+journalctl -u gc2607-camera.service -u gc2607-isp.service -f
 
 # Перезапуск
-sudo systemctl restart gc2607-camera.service
+sudo systemctl restart gc2607-camera.service gc2607-isp.service
 
 # Статус DKMS-модулей
 dkms status
 ```
+
+Быстрая проверка runtime:
+
+```bash
+v4l2-ctl --list-devices
+wpctl status
+```
+
+Должна быть камера `GC2607 Camera` на `/dev/video50`.
+
+---
+
+## Решение проблем
+
+- Если камера есть как device, но пропадает как source в PipeWire:
+  - Один раз перезагрузитесь.
+  - Затем повторно запустите `sudo ./install.sh`.
+- Если Chrome не видит камеру:
+  - Полностью закройте и заново откройте Chrome.
+  - Проверьте `chrome://settings/content/camera` и выберите `GC2607 Camera`.
+- Если снова появляется конфликтующая виртуальная камера:
+  - Проверьте, что `virtual-webcam.service` выключен:
+    `systemctl status virtual-webcam.service --no-pager`
 
 ---
 

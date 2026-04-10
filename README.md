@@ -23,10 +23,18 @@ sudo ./install.sh
 The script automatically:
 - Installs build dependencies
 - Builds and registers `gc2607.ko` via DKMS
-- Downloads kernel source, patches `ipu_bridge` for GC2607 support, registers via DKMS
+- Uses local kernel sources (fallback: kernel.org tarball), patches `ipu_bridge` for GC2607 support, builds via DKMS
 - Builds the C ISP processor (`gc2607_isp`, ~5% CPU vs ~43% for Python)
-- Installs a systemd service with auto-start on boot
-- Configures WirePlumber to hide raw IPU6 nodes so apps see only `GC2607 Camera`
+- Installs and enables systemd services (`gc2607-camera`, `gc2607-isp`)
+- Configures `v4l2loopback` as a single device (`/dev/video50`, `GC2607 Camera`)
+- Configures WirePlumber routing and user media stack sync (PipeWire/portal)
+- Disables known conflicting `virtual-webcam.service` if present
+
+After the first install, reboot once to ensure all module and media-stack changes are applied cleanly:
+
+```bash
+sudo reboot
+```
 
 ---
 
@@ -59,7 +67,7 @@ wb=auto                # auto, daylight, cloudy, shade,
 Apply changes:
 
 ```bash
-sudo systemctl restart gc2607-camera.service
+sudo systemctl restart gc2607-isp.service
 ```
 
 ---
@@ -68,17 +76,40 @@ sudo systemctl restart gc2607-camera.service
 
 ```bash
 # Status
-sudo systemctl status gc2607-camera.service
+sudo systemctl status gc2607-camera.service gc2607-isp.service
 
 # Live logs
-journalctl -u gc2607-camera.service -f
+journalctl -u gc2607-camera.service -u gc2607-isp.service -f
 
 # Restart
-sudo systemctl restart gc2607-camera.service
+sudo systemctl restart gc2607-camera.service gc2607-isp.service
 
 # DKMS module status
 dkms status
 ```
+
+Quick runtime check:
+
+```bash
+v4l2-ctl --list-devices
+wpctl status
+```
+
+You should see `GC2607 Camera` on `/dev/video50`.
+
+---
+
+## Troubleshooting
+
+- If camera appears as device but not as PipeWire source:
+  - Reboot once.
+  - Then run: `sudo ./install.sh` again.
+- If Chrome does not show camera:
+  - Fully close Chrome and reopen it.
+  - Check `chrome://settings/content/camera` and select `GC2607 Camera`.
+- If a conflicting virtual camera appears:
+  - Verify `virtual-webcam.service` is disabled:
+    `systemctl status virtual-webcam.service --no-pager`
 
 ---
 
