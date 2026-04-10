@@ -146,8 +146,8 @@ install_deps() {
 
     # Write modprobe.d config so v4l2loopback always loads with video_nr=50
     cat > /etc/modprobe.d/gc2607-v4l2loopback.conf <<'EOF'
-# GC2607 ISP output device — fixed at /dev/video50
-options v4l2loopback video_nr=50 card_label="GC2607 Camera" exclusive_caps=1
+# GC2607 ISP output device — fixed single virtual cam at /dev/video50
+options v4l2loopback devices=1 video_nr=50 card_label="GC2607 Camera" exclusive_caps=1
 EOF
     log "modprobe.d config written for v4l2loopback"
 
@@ -624,14 +624,23 @@ install_wireplumber() {
     mkdir -p "$wpdir"
     # Remove old config name if it exists from a previous install
     rm -f "${wpdir}/50-hide-ipu6-raw.conf"
-    # Hide raw IPU6 V4L2 devices so apps prefer /dev/video50 (v4l2loopback).
-    # Do not globally disable libcamera devices: that can hide unrelated cameras.
+    # Force apps to use the ISP output /dev/video50:
+    # 1) hide raw PCI-backed IPU6 V4L2 devices
+    # 2) hide libcamera-provided camera nodes (they bypass our ISP settings)
     cat > "${wpdir}/50-gc2607-routing.conf" <<'EOF'
 # Hide raw IPU6 V4L2 capture nodes (PCI devices) from PipeWire.
 # /dev/video50 (v4l2loopback) is NOT a PCI device so it stays visible.
 monitor.v4l2.rules = [
   {
     matches = [ { device.name = "~v4l2_device.pci-*" } ]
+    actions = { update-props = { device.disabled = true } }
+  }
+]
+
+# Hide libcamera camera nodes so desktop apps use /dev/video50 (ISP output)
+monitor.libcamera.rules = [
+  {
+    matches = [ { device.name = "~.*" } ]
     actions = { update-props = { device.disabled = true } }
   }
 ]
