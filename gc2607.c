@@ -933,26 +933,24 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	/* Sensor physical rotation — sensor is mounted upside-down (180°).
-	 * step=90 is required: kernel only accepts multiples of 90 degrees.
-	 * libcamera reads this default value and auto-rotates the image.
+	 * Must use the full kernel range [0, 270] step=90; restrict by
+	 * marking READ_ONLY. libcamera reads the default value (180°).
 	 */
 	{
 		struct v4l2_ctrl *rot;
 		rot = v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
 					V4L2_CID_CAMERA_SENSOR_ROTATION,
-					180, 180, 90, 180);
+					0, 270, 90, 180);
 		if (rot)
 			rot->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	}
 
-	/* Camera orientation: front-facing (laptop webcam above screen) */
+	/* Camera orientation: full range [0,2] required; default = front (0) */
 	{
 		struct v4l2_ctrl *orient;
 		orient = v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
 					   V4L2_CID_CAMERA_ORIENTATION,
-					   V4L2_CAMERA_ORIENTATION_FRONT,
-					   V4L2_CAMERA_ORIENTATION_FRONT,
-					   1,
+					   0, 2, 1,
 					   V4L2_CAMERA_ORIENTATION_FRONT);
 		if (orient)
 			orient->flags |= V4L2_CTRL_FLAG_READ_ONLY;
