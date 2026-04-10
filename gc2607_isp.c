@@ -606,10 +606,14 @@ int main(int argc, char *argv[])
     int  streaming = 0;   /* 1 = sensor open + STREAMON */
 
 #define READER_CHECK_INTERVAL_S  2   /* how often to poll /proc for readers */
+/* Stop only after several consecutive "no readers" checks to avoid
+ * rapid on/off oscillation when apps switch camera sessions. */
+#define NO_READER_STOP_CHECKS    3
     struct timespec last_reader_check = {0};
     struct timespec last_ae_time      = {0};
     clock_gettime(CLOCK_MONOTONIC, &last_reader_check);
     clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
+    int no_reader_checks = 0;
 
     size_t frame_bytes = (size_t)(OUT_W * OUT_H * 2);
 
@@ -633,50 +637,37 @@ int main(int argc, char *argv[])
                     streaming    = 1;
                     ae_fast_left = AE_FAST_FRAMES;
                     wb_fast_left = WB_FAST_FRAMES;
+                    no_reader_checks = 0;
                     if (has_subdev)
                         set_sensor_controls(subdev_path, cur_exposure, cur_gain);
                     clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
                 } else {
                     printf("[gc2607_isp] Failed to open capture device\n");
                 }
-            } else if (streaming && readers == 0) {
-                /* Nobody reading — stop sensor */
-                printf("[gc2607_isp] No consumers — stopping sensor (LED off)\n");
-                enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                xioctl(cap_fd, VIDIOC_STREAMOFF, &st);
-                for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
-                close(cap_fd);
-                cap_fd    = -1;
-                n_bufs    = 0;
-                streaming = 0;
-                frame_count = output_count = 0;
+            } else if (streaming) {
+                if (readers == 0) {
+                    no_reader_checks++;
+                    if (no_reader_checks >= NO_READER_STOP_CHECKS) {
+                        /* Nobody reading for several checks — stop sensor */
+                        printf("[gc2607_isp] No consumers — stopping sensor (LED off)\n");
+                        enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                        xioctl(cap_fd, VIDIOC_STREAMOFF, &st);
+                        for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
+                        close(cap_fd);
+                        cap_fd    = -1;
+                        n_bufs    = 0;
+                        streaming = 0;
+                        frame_count = output_count = 0;
+                        no_reader_checks = 0;
+                    }
+                } else {
+                    no_reader_checks = 0;
+                }
             }
         }
 
         /* ── Idle: nobody watching, just sleep ───────────────────────── */
         if (!streaming) {
-            /* v4l2loopback with exclusive_caps can stay invisible to some
-             * consumers until it receives at least one frame from producer.
-             * Push a neutral gray probe frame while idle; first successful
-             * write means a consumer is ready, then start sensor streaming. */
-            memset(flip_buf, 0x80, frame_bytes);
-            ssize_t probe = write(out_fd, flip_buf, frame_bytes);
-            if (probe > 0) {
-                printf("[gc2607_isp] Consumer probe succeeded — starting sensor (LED on)\n");
-                cap_fd = open_capture(capture_dev, bufs, &n_bufs);
-                if (cap_fd >= 0) {
-                    streaming    = 1;
-                    ae_fast_left = AE_FAST_FRAMES;
-                    wb_fast_left = WB_FAST_FRAMES;
-                    if (has_subdev)
-                        set_sensor_controls(subdev_path, cur_exposure, cur_gain);
-                    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
-                } else {
-                    printf("[gc2607_isp] Failed to open capture device after probe\n");
-                }
-            } else if (probe < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                perror("[gc2607_isp] idle probe write");
-            }
             usleep(500000);
             continue;
         }
