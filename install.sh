@@ -105,6 +105,24 @@ install_deps() {
     [ -d "/lib/modules/${KERN}/build" ] || \
         die "kernel-devel not found for ${KERN}. Install: sudo dnf install kernel-devel-${KERN}"
 
+    # Write modprobe.d config so v4l2loopback always loads with video_nr=50
+    cat > /etc/modprobe.d/gc2607-v4l2loopback.conf <<'EOF'
+# GC2607 ISP output device — fixed at /dev/video50
+options v4l2loopback video_nr=50 card_label="GC2607 Camera" exclusive_caps=1
+EOF
+    log "modprobe.d config written for v4l2loopback"
+
+    # Load it now so gc2607-isp.service doesn't have to wait
+    modprobe -r v4l2loopback 2>/dev/null || true
+    modprobe v4l2loopback || warn "v4l2loopback failed to load (will retry at boot)"
+
+    # Verify /dev/video50 appeared
+    if [ -e /dev/video50 ]; then
+        log "v4l2loopback OK: /dev/video50 ready"
+    else
+        warn "/dev/video50 not found yet — may appear after udev settles"
+    fi
+
     log "Dependencies OK"
 }
 
@@ -758,10 +776,6 @@ start_camera() {
             exit 0
         fi
     fi
-
-    # Load v4l2loopback for /dev/video50 (ISP output)
-    modprobe v4l2loopback video_nr=50 card_label="GC2607 Camera" \
-        exclusive_caps=1 2>/dev/null || true
 
     systemctl start gc2607-camera.service || \
         die "Camera setup failed. Check: journalctl -u gc2607-camera.service -n 30"
