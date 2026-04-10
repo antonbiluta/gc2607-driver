@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/inotify.h>
@@ -417,6 +419,48 @@ static void apply_arg(const char *key, const char *val)
     }
 }
 
+/* ── Consumer detection via /proc/PID/fd ───────────────────────────── *
+ * Returns number of processes (other than self) that have dev open.   *
+ * Called infrequently (~every 2 s) so /proc overhead is acceptable.  */
+static int count_readers(const char *dev)
+{
+    struct stat target;
+    if (stat(dev, &target) < 0) return 0;
+
+    DIR *proc = opendir("/proc");
+    if (!proc) return 0;
+
+    pid_t my_pid = getpid();
+    int found = 0;
+    struct dirent *pe;
+
+    while ((pe = readdir(proc)) != NULL && !found) {
+        if (!isdigit((unsigned char)pe->d_name[0])) continue;
+        pid_t pid = (pid_t)atoi(pe->d_name);
+        if (pid == my_pid) continue;
+
+        char fddir[64];
+        snprintf(fddir, sizeof(fddir), "/proc/%d/fd", pid);
+        DIR *fds = opendir(fddir);
+        if (!fds) continue;
+
+        struct dirent *fe;
+        while ((fe = readdir(fds)) != NULL && !found) {
+            if (fe->d_name[0] == '.') continue;
+            char link[128];
+            snprintf(link, sizeof(link), "/proc/%d/fd/%s", pid, fe->d_name);
+            struct stat lst;
+            if (stat(link, &lst) == 0 &&
+                lst.st_dev == target.st_dev &&
+                lst.st_ino == target.st_ino)
+                found++;
+        }
+        closedir(fds);
+    }
+    closedir(proc);
+    return found;
+}
+
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
@@ -526,8 +570,6 @@ int main(int argc, char *argv[])
         printf("[gc2607_isp] Warning: no sensor subdev (no hardware AE)\n");
 
     int cur_exposure = EXPOSURE_MAX, cur_gain = GAIN_MAX;
-    if (has_subdev)
-        set_sensor_controls(subdev_path, cur_exposure, cur_gain);
 
     /* inotify: watch the config *directory* so we catch atomic renames
      * (editors and install(1) write a temp file then rename it over the
@@ -538,71 +580,79 @@ int main(int argc, char *argv[])
         inotify_add_watch(inotify_fd, "/etc/gc2607",
                           IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
 
-    struct buffer bufs[NUM_BUFFERS];
-    int n_bufs = 0;
-    int cap_fd = open_capture(capture_dev, bufs, &n_bufs);
-    if (cap_fd < 0) return 1;
-
+    /* Output device — open once, keep open; we write frames when streaming */
     int out_fd = open_output(output_dev);
-    if (out_fd < 0) { close(cap_fd); return 1; }
+    if (out_fd < 0) return 1;
 
-    printf("[gc2607_isp] Streaming %dx%d @ %dfps\n", OUT_W, OUT_H, cfg_fps);
-    printf("[gc2607_isp] Sensor pauses automatically when no app uses the camera\n");
+    printf("[gc2607_isp] Ready. Sensor starts only when an app opens the camera.\n");
     printf("[gc2607_isp] Config hot-reload: edit %s (changes apply immediately)\n",
            CONFIG_PATH);
 
     /* ISP state */
     float brightness    = 1.0f;
-    float prev_bright8  = -1.0f; /* for scene-change detection */
+    float prev_bright8  = -1.0f;
     int   frame_count   = 0;
     int   output_count  = 0;
-    int   ae_fast_left  = AE_FAST_FRAMES; /* frames remaining in fast-AE mode */
-    int   wb_fast_left  = WB_FAST_FRAMES; /* frames remaining in fast-WB mode */
+    int   ae_fast_left  = AE_FAST_FRAMES;
+    int   wb_fast_left  = WB_FAST_FRAMES;
 
-    /* Consumer-detection state machine:
-     *   streaming=1 — sensor running, processing frames
-     *   streaming=0 — STREAMOFF issued, waiting for a consumer on output_dev
-     * After IDLE_THRESHOLD consecutive EAGAIN writes we STREAMOFF (LED off).
-     * We probe /dev/videoN by writing a gray frame; first success restarts. */
-#define IDLE_THRESHOLD  90   /* ~3 s at 30 fps */
-    int streaming     = 1;
-    int eagain_streak = 0;
+    /* Capture resources — allocated on-demand */
+    struct buffer bufs[NUM_BUFFERS];
+    int  n_bufs   = 0;
+    int  cap_fd   = -1;
+    int  streaming = 0;   /* 1 = sensor open + STREAMON */
+
+#define READER_CHECK_INTERVAL_S  2   /* how often to poll /proc for readers */
+    struct timespec last_reader_check = {0};
+    struct timespec last_ae_time      = {0};
+    clock_gettime(CLOCK_MONOTONIC, &last_reader_check);
+    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
 
     size_t frame_bytes = (size_t)(OUT_W * OUT_H * 2);
 
-    struct timespec last_ae_time;
-    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
-
     while (running) {
 
-        /* ── Idle: sensor off, poll for consumer ─────────────────────── */
-        if (!streaming) {
-            /* Write a gray frame to probe whether a consumer is reading */
-            memset(flip_buf, 0x80, frame_bytes); /* 0x80 = neutral gray YUYV */
-            ssize_t probe = write(out_fd, flip_buf, frame_bytes);
-            if (probe > 0) {
-                /* Consumer appeared — re-queue all buffers and restart */
-                for (int ri = 0; ri < n_bufs; ri++) {
-                    struct v4l2_buffer qb = {0};
-                    qb.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                    qb.memory = V4L2_MEMORY_MMAP;
-                    qb.index  = ri;
-                    xioctl(cap_fd, VIDIOC_QBUF, &qb);
-                }
-                enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                if (xioctl(cap_fd, VIDIOC_STREAMON, &st) == 0) {
-                    streaming     = 1;
-                    eagain_streak = 0;
+        /* ── Reader check: start/stop sensor based on /dev/video50 usage ── */
+        struct timespec now_rc;
+        clock_gettime(CLOCK_MONOTONIC, &now_rc);
+        double since_check = (now_rc.tv_sec  - last_reader_check.tv_sec) +
+                             (now_rc.tv_nsec - last_reader_check.tv_nsec) / 1e9;
+
+        if (since_check >= READER_CHECK_INTERVAL_S) {
+            last_reader_check = now_rc;
+            int readers = count_readers(output_dev);
+
+            if (!streaming && readers > 0) {
+                /* Someone opened /dev/video50 — start sensor */
+                printf("[gc2607_isp] Consumer appeared — starting sensor (LED on)\n");
+                cap_fd = open_capture(capture_dev, bufs, &n_bufs);
+                if (cap_fd >= 0) {
+                    streaming    = 1;
+                    ae_fast_left = AE_FAST_FRAMES;
+                    wb_fast_left = WB_FAST_FRAMES;
                     if (has_subdev)
                         set_sensor_controls(subdev_path, cur_exposure, cur_gain);
-                    printf("[gc2607_isp] Consumer detected — sensor started (LED on)\n");
+                    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
                 } else {
-                    perror("[gc2607_isp] VIDIOC_STREAMON");
-                    usleep(5000000);
+                    printf("[gc2607_isp] Failed to open capture device\n");
                 }
-            } else {
-                usleep(2000000); /* 2 s between probes */
+            } else if (streaming && readers == 0) {
+                /* Nobody reading — stop sensor */
+                printf("[gc2607_isp] No consumers — stopping sensor (LED off)\n");
+                enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                xioctl(cap_fd, VIDIOC_STREAMOFF, &st);
+                for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
+                close(cap_fd);
+                cap_fd    = -1;
+                n_bufs    = 0;
+                streaming = 0;
+                frame_count = output_count = 0;
             }
+        }
+
+        /* ── Idle: nobody watching, just sleep ───────────────────────── */
+        if (!streaming) {
+            usleep(500000);
             continue;
         }
 
@@ -756,22 +806,7 @@ int main(int argc, char *argv[])
         /* Return buffer to capture queue */
         if (xioctl(cap_fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF"); break; }
 
-        /* Track consecutive EAGAIN to detect "no consumers" */
-        if (wr < 0) {
-            if (errno == EAGAIN) {
-                if (++eagain_streak >= IDLE_THRESHOLD) {
-                    printf("[gc2607_isp] No consumers — pausing sensor (LED off)\n");
-                    enum v4l2_buf_type st = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                    xioctl(cap_fd, VIDIOC_STREAMOFF, &st);
-                    streaming     = 0;
-                    eagain_streak = 0;
-                }
-            } else {
-                perror("write output"); break;
-            }
-        } else {
-            eagain_streak = 0;
-        }
+        if (wr < 0 && errno != EAGAIN) { perror("write output"); break; }
 
         output_count++;
         if (output_count % 150 == 0) {
@@ -784,12 +819,12 @@ int main(int argc, char *argv[])
     printf("[gc2607_isp] Shutdown (%d sensor frames, %d output frames)\n",
            frame_count, output_count);
 
-    if (streaming) {
+    if (streaming && cap_fd >= 0) {
         enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         xioctl(cap_fd, VIDIOC_STREAMOFF, &t);
+        for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
+        close(cap_fd);
     }
-    for (int i = 0; i < n_bufs; i++) munmap(bufs[i].start, bufs[i].length);
-    close(cap_fd);
     close(out_fd);
     if (inotify_fd >= 0) close(inotify_fd);
     return 0;
