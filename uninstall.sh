@@ -33,10 +33,15 @@ log "Kernel: $KERN"
 
 # ── Stop service ───────────────────────────────────────────────────────
 log "Stopping service..."
+systemctl stop gc2607-wp-sync.timer 2>/dev/null || true
+systemctl disable gc2607-wp-sync.timer 2>/dev/null || true
+systemctl stop gc2607-wp-sync.service 2>/dev/null || true
 systemctl stop gc2607-isp.service 2>/dev/null || true
 systemctl disable gc2607-isp.service 2>/dev/null || true
 systemctl stop gc2607-camera.service 2>/dev/null || true
 systemctl disable gc2607-camera.service 2>/dev/null || true
+rm -f /etc/systemd/system/gc2607-wp-sync.timer
+rm -f /etc/systemd/system/gc2607-wp-sync.service
 rm -f /etc/systemd/system/gc2607-isp.service
 rm -f /etc/systemd/system/gc2607-camera.service
 systemctl daemon-reload
