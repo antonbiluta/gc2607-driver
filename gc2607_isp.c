@@ -655,6 +655,28 @@ int main(int argc, char *argv[])
 
         /* ── Idle: nobody watching, just sleep ───────────────────────── */
         if (!streaming) {
+            /* v4l2loopback with exclusive_caps can stay invisible to some
+             * consumers until it receives at least one frame from producer.
+             * Push a neutral gray probe frame while idle; first successful
+             * write means a consumer is ready, then start sensor streaming. */
+            memset(flip_buf, 0x80, frame_bytes);
+            ssize_t probe = write(out_fd, flip_buf, frame_bytes);
+            if (probe > 0) {
+                printf("[gc2607_isp] Consumer probe succeeded — starting sensor (LED on)\n");
+                cap_fd = open_capture(capture_dev, bufs, &n_bufs);
+                if (cap_fd >= 0) {
+                    streaming    = 1;
+                    ae_fast_left = AE_FAST_FRAMES;
+                    wb_fast_left = WB_FAST_FRAMES;
+                    if (has_subdev)
+                        set_sensor_controls(subdev_path, cur_exposure, cur_gain);
+                    clock_gettime(CLOCK_MONOTONIC, &last_ae_time);
+                } else {
+                    printf("[gc2607_isp] Failed to open capture device after probe\n");
+                }
+            } else if (probe < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("[gc2607_isp] idle probe write");
+            }
             usleep(500000);
             continue;
         }
