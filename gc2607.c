@@ -869,7 +869,7 @@ static int gc2607_probe(struct i2c_client *client)
 	}
 
 	/* Initialize control handler with V4L2 controls */
-	v4l2_ctrl_handler_init(&gc2607->ctrls, 6);
+	v4l2_ctrl_handler_init(&gc2607->ctrls, 8);
 
 	/* Link frequency control (required by IPU6) */
 	gc2607->link_freq = v4l2_ctrl_new_int_menu(&gc2607->ctrls,
@@ -930,6 +930,31 @@ static int gc2607_probe(struct i2c_client *client)
 					   1335 - 1080);
 		if (vblank)
 			vblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	}
+
+	/* Sensor physical rotation — sensor is mounted upside-down (180°).
+	 * libcamera reads this to auto-rotate the image correctly.
+	 */
+	{
+		struct v4l2_ctrl *rot;
+		rot = v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
+					V4L2_CID_CAMERA_SENSOR_ROTATION,
+					180, 180, 1, 180);
+		if (rot)
+			rot->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	}
+
+	/* Camera orientation: front-facing (laptop webcam above the screen) */
+	{
+		struct v4l2_ctrl *orient;
+		orient = v4l2_ctrl_new_std(&gc2607->ctrls, NULL,
+					   V4L2_CID_CAMERA_ORIENTATION,
+					   V4L2_CAMERA_ORIENTATION_FRONT,
+					   V4L2_CAMERA_ORIENTATION_FRONT,
+					   1,
+					   V4L2_CAMERA_ORIENTATION_FRONT);
+		if (orient)
+			orient->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	}
 
 	gc2607->sd.ctrl_handler = &gc2607->ctrls;
