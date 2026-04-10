@@ -555,19 +555,26 @@ install_wireplumber() {
     [ -n "$user" ] || { warn "Could not determine user, skipping wireplumber config"; return; }
 
     mkdir -p "$wpdir"
-    cat > "${wpdir}/50-hide-ipu6-raw.conf" <<'EOF'
+    # Remove old config name if it exists from a previous install
+    rm -f "${wpdir}/50-hide-ipu6-raw.conf"
+    # Hide the raw IPU6 V4L2 devices AND the libcamera representation of gc2607.
+    # This forces all apps (GNOME Camera, browsers, etc.) to use /dev/video50
+    # which is the v4l2loopback device fed by gc2607_isp (with our ISP pipeline:
+    # rotation, white balance, brightness, AE).
+    cat > "${wpdir}/50-gc2607-routing.conf" <<'EOF'
+# Hide raw IPU6 V4L2 capture nodes (PCI devices) from PipeWire
 monitor.v4l2.rules = [
   {
-    matches = [
-      {
-        device.name = "~v4l2_device.pci-*"
-      }
-    ]
-    actions = {
-      update-props = {
-        device.disabled = true
-      }
-    }
+    matches = [ { device.name = "~v4l2_device.pci-*" } ]
+    actions = { update-props = { device.disabled = true } }
+  }
+]
+
+# Hide libcamera representation of gc2607 so apps use /dev/video50 instead
+monitor.libcamera.rules = [
+  {
+    matches = [ { device.name = "~.*" } ]
+    actions = { update-props = { device.disabled = true } }
   }
 ]
 EOF
