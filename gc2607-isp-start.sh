@@ -96,8 +96,7 @@ log "Media device: $MEDIA_DEV"
 CAP_DEV=""
 CAP_DEV=$(find_capture_dev "$MEDIA_DEV") || true
 if [ -z "$CAP_DEV" ]; then
-    warn "Could not auto-detect capture device; falling back to /dev/video0"
-    CAP_DEV="/dev/video0"
+    die "Could not auto-detect IPU6 capture device for GC2607"
 fi
 log "Capture device: $CAP_DEV"
 

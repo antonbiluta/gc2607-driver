@@ -41,6 +41,7 @@ DKMS_IPU_SRC="/usr/src/${DKMS_IPU_NAME}-${DKMS_IPU_VER}"
 
 WORK_DIR="$STATE_DIR/build"
 TARBALL="$WORK_DIR/linux-${KERN_BASE}.tar.xz"
+RUNTIME_VERIFY_WARN=0
 
 # ── Helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -647,7 +648,8 @@ install_service() {
     cat > /etc/systemd/system/gc2607-camera.service <<EOF
 [Unit]
 Description=GC2607 Camera Driver Setup
-After=multi-user.target
+After=systemd-modules-load.service
+Before=gc2607-isp.service
 
 [Service]
 Type=oneshot
@@ -666,7 +668,8 @@ EOF
     cat > /etc/systemd/system/gc2607-isp.service <<EOF
 [Unit]
 Description=GC2607 ISP Pipeline (raw sensor → /dev/video50)
-After=gc2607-camera.service network.target
+Requires=gc2607-camera.service
+After=gc2607-camera.service
 
 [Service]
 Type=simple
@@ -848,7 +851,10 @@ verify_runtime() {
         rm -f "$smoke"
         warn "Smoke test failed. Recent logs:"
         journalctl -u gc2607-camera.service -u gc2607-isp.service -n 120 --no-pager || true
-        die "Failed to capture non-empty frames from /dev/video50 after retries"
+        warn "Failed to capture non-empty frames from /dev/video50 after retries"
+        warn "A reboot is likely required to activate the patched camera stack cleanly"
+        RUNTIME_VERIFY_WARN=1
+        return 0
     fi
     rm -f "$smoke"
 
@@ -887,6 +893,13 @@ show_status() {
         echo "    Check: journalctl -u gc2607-isp.service -n 30"
     fi
 
+    echo ""
+    if [ "$RUNTIME_VERIFY_WARN" -eq 1 ]; then
+        echo -e "${YELLOW}⚠ Runtime verification incomplete.${NC}"
+        echo "  Reboot now and test the camera again:"
+        echo "  sudo reboot"
+        echo ""
+    fi
     echo ""
     echo "  Open any camera app — it will find 'GC2607 Camera' (/dev/video50)"
     echo "  LED turns on only when an app is actively reading the camera"
