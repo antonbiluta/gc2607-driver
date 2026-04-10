@@ -88,25 +88,8 @@ if [ -z "$MEDIA_DEV" ]; then
 fi
 log "Sensor found on $MEDIA_DEV"
 
-# ── Configure media pipeline ─────────────────────────────────────────
-media-ctl -d "$MEDIA_DEV" \
-    -V '"Intel IPU6 CSI2 0":0 [fmt:SGRBG10_1X10/1920x1080]' 2>/dev/null || true
-media-ctl -d "$MEDIA_DEV" \
-    -V '"Intel IPU6 CSI2 0":1 [fmt:SGRBG10_1X10/1920x1080]' 2>/dev/null || true
-
-CAPTURE_DEV=$(media-ctl -d "$MEDIA_DEV" --print-topology 2>/dev/null \
-    | grep -A3 "Intel IPU6 ISYS Capture 0" \
-    | grep -o "/dev/video[0-9]*" | head -1) || true
-
-if [ -n "$CAPTURE_DEV" ]; then
-    media-ctl -d "$MEDIA_DEV" \
-        -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null || true
-    v4l2-ctl -d "$CAPTURE_DEV" \
-        --set-fmt-video=width=1920,height=1080,pixelformat=BA10 2>/dev/null || true
-    log "Pipeline configured: $CAPTURE_DEV"
-else
-    log "WARNING: Could not find capture device, pipeline not configured"
-fi
-
-# ── Done — sensor is ready, will activate on-demand via libcamera ────
+# ── Done — libcamera manages the pipeline and links on demand ────────
+# Do NOT enable media links here — libcamera configures them when an app
+# opens the camera. Enabling the link here would cause "Device or resource
+# busy" errors when libcamera tries to set up the pipeline.
 log "GC2607 ready. Camera activates on demand when an app opens it."
