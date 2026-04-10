@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <limits.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/inotify.h>
