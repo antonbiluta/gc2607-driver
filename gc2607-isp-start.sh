@@ -78,13 +78,16 @@ fi
 log "Capture device: $CAP_DEV"
 
 # ── Enable IPU6 media link: CSI2 pad1 → ISYS Capture pad0 ──────────────
+# The link must be enabled before opening the capture device.
+# We set it here once; gc2607_isp keeps it enabled while streaming.
+# If already enabled (e.g. after a service restart), the command is a no-op.
 log "Enabling media link..."
-if media-ctl -d "$MEDIA_DEV" \
-        -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null; then
-    log "Media link enabled"
-else
-    warn "Could not enable media link (may already be active, or libcamera manages it)"
-fi
+media-ctl -d "$MEDIA_DEV" \
+    -l '"Intel IPU6 CSI2 0":1 -> "Intel IPU6 ISYS Capture 0":0[1]' 2>/dev/null || true
+
+# Also configure the sensor pad format so IPU6 knows what to expect
+media-ctl -d "$MEDIA_DEV" \
+    --set-v4l2 '"gc2607 5-0037":0[fmt:SGRBG10_1X10/1920x1080]' 2>/dev/null || true
 
 # ── Set capture pixel format ─────────────────────────────────────────────
 v4l2-ctl -d "$CAP_DEV" \
